@@ -82,9 +82,9 @@ def parse_seeyou_waypoints(lines, bounds=None):
     for raw_line in lines:
         if isinstance(raw_line, bytes):
             try:
-                line = raw_line.decode('utf-8')
+                line = raw_line.decode("utf-8")
             except UnicodeDecodeError:
-                line = raw_line.decode('windows-1252')
+                line = raw_line.decode("windows-1252")
             line = line.strip()
         else:
             line = raw_line.strip()
