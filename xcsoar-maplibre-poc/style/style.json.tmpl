@@ -1,0 +1,90 @@
+{
+  "version": 8,
+  "name": "XCSoar MapLibre test bundle",
+  "metadata": {
+    "xcsoar:offline": true,
+    "xcsoar:bundle_version": 1,
+    "xcsoar:role": "visual basemap only - not used for terrain or overlay calculations"
+  },
+  "sources": {
+    "openmaptiles": {
+      "type": "vector",
+      "url": "mbtiles://./basemap.mbtiles",
+      "attribution": "\u00a9 OpenStreetMap contributors"
+    },
+    "terrain": {
+      "type": "raster-dem",
+      "url": "mbtiles://./hillshade.mbtiles",
+      "tileSize": 256,
+      "encoding": "mapbox",
+      "attribution": "Elevation data see DATA_SOURCES.md"
+    }
+  },
+  "sprite": "./sprites/sprite",
+  "glyphs": "./glyphs/{fontstack}/{range}.pbf",
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": { "background-color": "#f2efe9" }
+    },
+    {
+      "id": "hillshade",
+      "type": "hillshade",
+      "source": "terrain",
+      "paint": {
+        "hillshade-shadow-color": "#5b524a",
+        "hillshade-highlight-color": "#ffffff",
+        "hillshade-exaggeration": 0.6
+      }
+    },
+    {
+      "id": "landcover-wood",
+      "type": "fill",
+      "source": "openmaptiles",
+      "source-layer": "landcover",
+      "filter": ["==", ["get", "class"], "wood"],
+      "paint": { "fill-color": "#c8dcb4", "fill-opacity": 0.5 }
+    },
+    {
+      "id": "water",
+      "type": "fill",
+      "source": "openmaptiles",
+      "source-layer": "water",
+      "paint": { "fill-color": "#a9cbdf" }
+    },
+    {
+      "id": "roads-major",
+      "type": "line",
+      "source": "openmaptiles",
+      "source-layer": "transportation",
+      "filter": ["in", ["get", "class"], ["literal", ["motorway", "trunk", "primary"]]],
+      "paint": { "line-color": "#e8a45c", "line-width": 1.5 }
+    },
+    {
+      "id": "roads-minor",
+      "type": "line",
+      "source": "openmaptiles",
+      "source-layer": "transportation",
+      "filter": ["in", ["get", "class"], ["literal", ["secondary", "tertiary", "minor"]]],
+      "minzoom": 11,
+      "paint": { "line-color": "#ffffff", "line-width": 0.8 }
+    },
+    {
+      "id": "place-labels",
+      "type": "symbol",
+      "source": "openmaptiles",
+      "source-layer": "place",
+      "layout": {
+        "text-field": ["get", "name"],
+        "text-font": ["Noto Sans Regular"],
+        "text-size": 12
+      },
+      "paint": {
+        "text-color": "#3a3a3a",
+        "text-halo-color": "#ffffff",
+        "text-halo-width": 1.2
+      }
+    }
+  ]
+}

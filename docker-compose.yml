@@ -9,6 +9,8 @@ services:
       - "9090:9090"
     volumes:
       - mapgen-jobs:/opt/mapgen/jobs
+      - ./lib:/opt/mapgen/lib
+      - ./bin:/opt/mapgen/bin
   mapgen-worker:
     build:
       context: .
@@ -17,7 +19,19 @@ services:
     volumes:
       - mapgen-jobs:/opt/mapgen/jobs
       - mapgen-data:/opt/mapgen/data
+      - ./lib:/opt/mapgen/lib
+      - ./bin:/opt/mapgen/bin
 
 volumes:
   mapgen-data:
+      driver: local
+      driver_opts:
+        type: none
+        o: bind
+        device: /home/bapt/.xcsoar_mapgen/mapgen-data
   mapgen-jobs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /home/bapt/.xcsoar_mapgen/mapgen-jobs

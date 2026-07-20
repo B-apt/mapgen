@@ -57,6 +57,27 @@ def main():
         help="create embedded waypoint file from welt2000 database",
     )
 
+    parser.add_argument(
+        "-m",
+        "--maplibre",
+        dest="maplibre",
+        action="store_true",
+        default=False,
+        help="also build an offline MapLibre visual-basemap bundle (vector "
+        "tiles + hillshade + style.json) into the .xcm file. Off by "
+        "default - existing output is unaffected. Requires osmium-tool, "
+        "planetiler and gdal on this machine, and a pre-fetched regional "
+        "OSM extract in the data cache - see docs/DATA_SOURCES.md.",
+    )
+    parser.add_argument(
+        "--maplibre-static",
+        metavar="DIR",
+        dest="maplibre_static",
+        default=None,
+        help="directory of job-independent MapLibre assets (style "
+        "template, sprites, glyphs). Defaults to <data>/maplibre-static.",
+    )
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "-b",
@@ -99,6 +120,13 @@ def main():
             compressed=args.compressed, level_of_detail=args.level_of_detail
         )
         generator.add_terrain(args.resolution)
+        if args.maplibre:
+            # Optional, additive: only ever paints a visual base map layer.
+            # Terrain/topology/waypoints/airspace above are untouched.
+            dir_static = args.maplibre_static or os.path.join(
+                app_dir, "data", "maplibre-static"
+            )
+            generator.add_maplibre(dir_static=dir_static, name=args.output_file)
         generator.create(args.output_file)
         generator.cleanup()
     finally:

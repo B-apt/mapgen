@@ -1,10 +1,37 @@
 # Creates a mapgen-worker instance for building maps
 FROM debian:bullseye-slim
-ENV MAPWRK_PKGS="ca-certificates python3-jsonschema python3-requests p7zip gdal-bin mapserver-bin wget"
+ENV MAPWRK_PKGS="ca-certificates python3-jsonschema python3-requests p7zip gdal-bin python3-gdal mapserver-bin wget osmium-tool sqlite3 python3-pip vim less curl unzip"
 ENV DEBIAN_FRONTEND=noninteractive
 
 # install base packages needed for mapgen
+# python3-gdal provides gdal2tiles.py's osgeo bindings (gdal-bin alone
+# ships gdalwarp/gdal_translate/gdalbuildvrt but not gdal2tiles.py's deps)
 RUN apt-get update && apt install -y --no-install-recommends $MAPWRK_PKGS && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN pip install numpy rasterio
+
+# Planetiler 0.10.x is compiled for Java 21 class files; bullseye's
+# default-jre only ships OpenJDK 11 (UnsupportedClassVersionError), so
+# fetch a standalone Temurin 21 JRE instead of relying on apt for Java.
+RUN curl -L -o /tmp/jre21.tar.gz \
+        https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jre_x64_linux_hotspot_21.0.11_10.tar.gz \
+    && mkdir -p /opt/java21 \
+    && tar -xzf /tmp/jre21.tar.gz -C /opt/java21 --strip-components=1 \
+    && rm /tmp/jre21.tar.gz
+RUN curl -L -o /usr/local/bin/planetiler.jar \
+        https://github.com/onthegomap/planetiler/releases/download/v0.10.2/planetiler.jar \
+    && cat <<'EOF' > /usr/local/bin/planetiler
+#!/bin/sh
+exec /opt/java21/bin/java -Xmx4g -jar /usr/local/bin/planetiler.jar "$@"
+EOF
+RUN chmod +x /usr/local/bin/planetiler
+
+# spreet: builds the MapLibre sprite sheet (sprite.png + sprite.json) from
+# an SVG icon set. Prebuilt static musl binary - no Rust toolchain needed.
+RUN curl -L -o /tmp/spreet.tar.gz \
+        https://github.com/flother/spreet/releases/download/v0.13.1/spreet-x86_64-unknown-linux-musl.tar.gz \
+    && tar -xzf /tmp/spreet.tar.gz -C /usr/local/bin spreet \
+    && chmod +x /usr/local/bin/spreet \
+    && rm /tmp/spreet.tar.gz
 
 # Copy python scripts of mapgen to target
 COPY lib/ /opt/mapgen/lib/

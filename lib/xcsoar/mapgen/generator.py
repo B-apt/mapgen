@@ -162,6 +162,42 @@ author: {author}
             welt2000cup.create(self.__dir_data, self.__dir_temp, bounds)
         )
 
+    def add_maplibre(self, dir_static, name="XCSoar map", min_zoom=0, max_zoom=14):
+        """
+        Adds an optional, additive offline MapLibre visual-basemap bundle
+        to the map, under a "maplibre/" folder inside the .xcm zip file.
+
+        This never touches terrain.jp2/terrain.j2w/topology.tpl/the
+        shapefiles/waypoints/airspace - those keep being built exactly as
+        they are by the other add_*() methods above. MapLibre is only
+        ever used client-side to paint a decorative background texture
+        underneath XCSoar's own terrain/topology/airspace rendering.
+
+        @param dir_static: directory of job-independent MapLibre assets
+                            (style.json.tmpl, sprites/, glyphs/) - see
+                            docs/GENERATE_TEST_BUNDLE.md.
+        """
+        print("Adding MapLibre bundle...")
+        if not self.__bounds:
+            raise RuntimeError("Boundaries undefined.")
+
+        from xcsoar.mapgen.maplibre import MapLibreBundle
+
+        bundle_dir = MapLibreBundle(
+            dir_data=self.__dir_data, dir_temp=self.__dir_temp, dir_static=dir_static
+        ).build(self.__bounds, name=name, min_zoom=min_zoom, max_zoom=max_zoom)
+
+        for root, _dirs, files in os.walk(bundle_dir):
+            for filename in files:
+                full_path = os.path.join(root, filename)
+                arcname = os.path.join(
+                    "maplibre", os.path.relpath(full_path, bundle_dir)
+                )
+                # mbtiles/png/pbf payloads are already compressed; re-deflating
+                # them on top just burns CPU for no size win.
+                already_compressed = filename.endswith((".mbtiles", ".png", ".pbf"))
+                self.__files.add(full_path, not already_compressed, arcname=arcname)
+
     def set_bounds(self, bounds):
         if not isinstance(bounds, GeoRect):
             raise RuntimeError("GeoRect expected.")
@@ -181,9 +217,13 @@ author: {author}
             for file in self.__files:
                 if os.path.isfile(file[0]):
                     # file[1] is the flag if we should compress the file
+                    # file[2] is an optional explicit archive name (used to
+                    # preserve a subdirectory, e.g. "maplibre/..."); falls
+                    # back to the historical flat os.path.basename()
+                    arcname = file[2] if len(file) > 2 and file[2] else os.path.basename(file[0])
                     z.write(
                         file[0],
-                        os.path.basename(file[0]),
+                        arcname,
                         ZIP_DEFLATED if file[1] else ZIP_STORED,
                     )
         finally:
