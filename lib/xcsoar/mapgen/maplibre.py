@@ -49,7 +49,20 @@ import shutil
 import sqlite3
 import subprocess
 
+from xcsoar.mapgen.georect import GeoRect
 from xcsoar.mapgen.util import slurp, spew
+
+
+class NoDemCoverageError(RuntimeError):
+    """
+    Raised when the requested bounds have zero overlap with the DEM tiles
+    available in data/dem/ (Sonny LiDAR) and data/dem3/ (SRTM cache).
+    Generator.add_maplibre() catches this specifically and skips adding a
+    maplibre/ folder to the zip rather than failing the whole map job -
+    unlike other failures in this module (missing OSM extract, a
+    planetiler/gdal crash, ...), which still propagate as hard errors.
+    """
+
 
 _CMD_OSMIUM = "osmium"
 _CMD_PLANETILER = "planetiler"  # wrapper script around `java -jar planetiler.jar`
@@ -113,12 +126,17 @@ class MapLibreBundle(object):
         Returns the bundle directory path (dir_temp/maplibre) so the
         caller can fold it into the zip.
         """
-        os.makedirs(self.__bundle_dir, exist_ok=True)
-
-        pbf_extract = self.__extract_osm(bounds)
-        self.__build_vector_tiles(pbf_extract, min_zoom, max_zoom)
-
-        dem_tiles, dem_sources = self.__find_dem_tiles(bounds)
+        # Checked first, before any expensive work (OSM extract, planetiler),
+        # so a bbox with zero DEM coverage fails fast rather than burning
+        # CPU on a vector-tile build that will just be thrown away by the
+        # caller (Generator.add_maplibre() catches NoDemCoverageError and
+        # skips the whole bundle - see there for why).
+        hillshade_bounds, dem_tiles, dem_sources = self.__find_dem_tiles(bounds)
+        if hillshade_bounds is not bounds:
+            print(
+                "Hillshade extent clipped to available DEM coverage: "
+                "requested {} -> using {}".format(bounds, hillshade_bounds)
+            )
         print(
             "Hillshade DEM tiles: {} found ({} from Sonny LiDAR, {} from "
             "SRTM cache)".format(
@@ -127,7 +145,13 @@ class MapLibreBundle(object):
                 dem_sources.count("srtm"),
             )
         )
-        self.__build_hillshade_tiles(dem_tiles, bounds, min_zoom, max_zoom)
+
+        os.makedirs(self.__bundle_dir, exist_ok=True)
+
+        pbf_extract = self.__extract_osm(bounds)
+        self.__build_vector_tiles(pbf_extract, bounds, min_zoom, max_zoom)
+
+        self.__build_hillshade_tiles(dem_tiles, hillshade_bounds, min_zoom, max_zoom)
 
         self.__copy_static_assets()
         self.__write_style_json(name, max_zoom)
@@ -225,7 +249,20 @@ class MapLibreBundle(object):
             )
         return paths
 
-    def __build_vector_tiles(self, pbf_extract, min_zoom, max_zoom):
+    def __build_vector_tiles(self, pbf_extract, bounds, min_zoom, max_zoom):
+        """
+        Without an explicit --bounds, planetiler derives tile bounds from
+        the OSM extract's own node coordinates. If the requested bbox
+        falls (partially or entirely) outside the operator's regional OSM
+        extract, that extract can come back empty (0 nodes) - and an
+        empty node set makes planetiler's bounds auto-detection silently
+        fall back to the WHOLE WORLD, which the OpenMapTiles profile then
+        happily tiles at every requested zoom level for its global
+        water/natural-earth/lake-centerline layers (millions of tiles,
+        many minutes, hundreds of MB) instead of erroring out. Always
+        passing the job's actual bounds avoids this regardless of how
+        much (or how little) OSM data the extract actually contains.
+        """
         mbtiles = os.path.join(self.__bundle_dir, "basemap.mbtiles")
         aux_sources = self.__locate_planetiler_aux_sources()
 
@@ -233,6 +270,9 @@ class MapLibreBundle(object):
             _CMD_PLANETILER,
             "--osm-path=" + pbf_extract,
             "--output=" + mbtiles,
+            "--bounds={},{},{},{}".format(
+                bounds.left, bounds.bottom, bounds.right, bounds.top
+            ),
             "--minzoom=" + str(min_zoom),
             "--maxzoom=" + str(max_zoom),
             "--force",
@@ -284,9 +324,21 @@ class MapLibreBundle(object):
         how terrain.jp2 itself is built.
 
         "mandatory" tiles are the 1-degree cells overlapping `bounds`
-        directly - build() fails if any of those are missing from both
-        caches. The wider padded ring (matching srtm.py's own -1/+1
-        buffer, for clean edge interpolation) is best-effort only.
+        directly. The wider padded ring (matching srtm.py's own -1/+1
+        buffer, for clean edge interpolation) is best-effort only and
+        never affects coverage/clipping decisions.
+
+        DEM coverage for a testing setup (e.g. one country's worth of
+        Sonny/SRTM tiles) commonly falls short of an arbitrary requested
+        bbox, so this doesn't hard-fail on a partial shortfall: it returns
+        a (possibly) smaller hillshade_bounds clipped to whatever tiles
+        are actually available, intersected with the requested bounds.
+        Only the OSM/vector-tile layer keeps covering the full requested
+        bounds - see build().
+
+        Returns (hillshade_bounds, dem_tile_paths, dem_tile_sources).
+        Raises NoDemCoverageError if none of the mandatory tiles are
+        available at all (nothing to clip to).
         """
 
         def needed_tiles(pad):
@@ -319,16 +371,34 @@ class MapLibreBundle(object):
                     "lon={}".format(lat, lon)
                 )
 
-        missing_mandatory = mandatory - found_mandatory
-        if missing_mandatory:
-            raise RuntimeError(
-                "Missing mandatory DEM tile(s) for the MapLibre hillshade "
-                "layer: {}. Checked data/dem/ (Sonny LiDAR) and data/dem3/ "
-                "(SRTM cache) under {}.".format(
-                    sorted(missing_mandatory), self.__dir_data
+        if not found_mandatory:
+            raise NoDemCoverageError(
+                "No DEM tiles available for the MapLibre hillshade layer "
+                "anywhere in the requested bounds {}. Checked data/dem/ "
+                "(Sonny LiDAR) and data/dem3/ (SRTM cache) under {}.".format(
+                    bounds, self.__dir_data
                 )
             )
-        return found_paths, found_sources
+
+        if found_mandatory == mandatory:
+            # Full coverage - no clipping needed.
+            return bounds, found_paths, found_sources
+
+        # Partial coverage: clip the hillshade extent to the bounding
+        # rectangle of the mandatory cells that ARE covered, intersected
+        # with the originally requested bounds (a 1-degree cell (lat, lon)
+        # spans [lon, lon+1] x [lat, lat+1]). Any extra tiles found in the
+        # padded ring outside this rectangle are harmless - gdalwarp's
+        # -te clip below just ignores data outside hillshade_bounds.
+        lats = [lat for lat, _lon in found_mandatory]
+        lons = [lon for _lat, lon in found_mandatory]
+        hillshade_bounds = GeoRect(
+            left=max(bounds.left, min(lons)),
+            right=min(bounds.right, max(lons) + 1),
+            top=min(bounds.top, max(lats) + 1),
+            bottom=max(bounds.bottom, min(lats)),
+        )
+        return hillshade_bounds, found_paths, found_sources
 
     def __build_hillshade_tiles(self, dem_tiles, bounds, min_zoom, max_zoom):
         """

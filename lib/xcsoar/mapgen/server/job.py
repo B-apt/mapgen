@@ -22,6 +22,7 @@ class JobDescription:
     compressed = False
     level_of_detail = 3
     welt2000 = False
+    maplibre = False
 
 
 class Job:

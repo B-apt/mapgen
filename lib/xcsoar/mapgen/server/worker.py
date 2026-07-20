@@ -95,6 +95,14 @@ This link is valid for 7 days.
                 job.update_status("Adding airspace file...")
                 generator.add_airspace_file(job.file_path(description.airspace_file))
 
+            if description.maplibre:
+                job.update_status("Creating MapLibre bundle...")
+                generator.add_maplibre(
+                    dir_static=os.path.join(self.__dir_data, "maplibre-static"),
+                    name=description.name,
+                    max_zoom=mapgen["maplibre_max_zoom"],
+                )
+
             job.update_status("Creating map file...")
 
             try:

@@ -71,6 +71,7 @@ class Server(object):
         desc.resolution = 3.0 if "highres" in params else 9.0
         desc.compressed = "compressed" in params
         desc.welt2000 = "welt2000" in params
+        desc.maplibre = "maplibre" in params
         desc.level_of_detail = int(params["level_of_detail"])
 
         selection = params["selection"]

@@ -28,6 +28,12 @@
     <label for="highres">High resolution terrain (3 arcseconds per pixel instead of 9)</label><br/>
     <input type="checkbox" name="compressed" id="compressed"/>
     <label for="compressed">Compressed topography (smaller filesize, but slower)</label><br/>
+    <input type="checkbox" name="maplibre" id="maplibre"/>
+    <label for="maplibre">Include an offline MapLibre visual basemap (experimental, adds build time)</label><br/>
+    <em style="font-size: 10pt;">Note: the basemap's hillshade layer is only as large as our elevation data
+    coverage allows - if your selected bounds reach outside that coverage, the hillshade is silently
+    cropped to whatever is available (or omitted entirely if there is none), while the rest of the map
+    is built normally.</em>
     <hr/>
     <span style="font-size: 10pt;">Level of detail:</span><br/>
     <input type="radio" name="level_of_detail" value="3" id="radio_lod3" checked="checked"/>

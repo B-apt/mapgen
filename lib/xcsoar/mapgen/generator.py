@@ -181,11 +181,19 @@ author: {author}
         if not self.__bounds:
             raise RuntimeError("Boundaries undefined.")
 
-        from xcsoar.mapgen.maplibre import MapLibreBundle
+        from xcsoar.mapgen.maplibre import MapLibreBundle, NoDemCoverageError
 
-        bundle_dir = MapLibreBundle(
-            dir_data=self.__dir_data, dir_temp=self.__dir_temp, dir_static=dir_static
-        ).build(self.__bounds, name=name, min_zoom=min_zoom, max_zoom=max_zoom)
+        try:
+            bundle_dir = MapLibreBundle(
+                dir_data=self.__dir_data, dir_temp=self.__dir_temp, dir_static=dir_static
+            ).build(self.__bounds, name=name, min_zoom=min_zoom, max_zoom=max_zoom)
+        except NoDemCoverageError as e:
+            # Testing-scale DEM caches (e.g. one country) commonly fall
+            # short of an arbitrary requested bbox - skip the bundle
+            # rather than failing the whole map job over an optional,
+            # purely decorative layer.
+            print("Skipping MapLibre bundle: {}".format(e))
+            return
 
         for root, _dirs, files in os.walk(bundle_dir):
             for filename in files:
