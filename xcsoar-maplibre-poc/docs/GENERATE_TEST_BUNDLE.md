@@ -174,13 +174,20 @@ structure); the flat `tiles/` tree's file count and format matches the
 mbtiles content; and the sprite/glyph assets are well-formed. On the real
 Chamonix build this passes with 0 failures, 0 warnings.
 
-If you do want an actual rendered pixel preview later (e.g. once Part 2/3
-embeds MapLibre Native in XCSoar itself and a real build of the library
+For an actual rendered visual check in a browser (no build step, uses
+MapLibre GL JS from a CDN), copy `scripts/preview.html` into the unzipped
+bundle next to `style.json`, serve that directory (`python3 -m http.server
+8080`), and open `http://localhost:8080/preview.html` - it rewrites the
+bundle's `mbtiles://` source URLs to the flat `tiles/{z}/{x}/{y}` tree on
+the fly and renders the real style.json, layers, sprite and glyphs
+unmodified. See the comment at the top of that file for details.
+
+If you instead want to test against MapLibre Native specifically (e.g.
+once Part 2/3 embeds it in XCSoar itself and a real build of the library
 exists on your machine), point `mbgl-render --style style.json` at a copy
-of `style.json` with the `sources[*].url` fields rewritten to
-`file://.../tiles/basemap/{z}/{x}/{y}.pbf` and
-`file://.../tiles/hillshade/{z}/{x}/{y}.png` - that's exactly what
-`maplibre/tiles/` is for.
+of `style.json` with the `sources[*].url` fields rewritten the same way,
+to `file://.../tiles/basemap/{z}/{x}/{y}.pbf` and
+`file://.../tiles/hillshade/{z}/{x}/{y}.png`.
 
 ## 5. What "success" looks like for Part 1
 

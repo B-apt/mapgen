@@ -1,0 +1,83 @@
+<!--
+  Zero-dependency browser preview for a mapgen MapLibre bundle, using
+  MapLibre GL JS (https://github.com/maplibre/maplibre-gl-js) from a CDN -
+  no npm/build step needed.
+
+  Usage:
+    1. Unzip a .xcm built with --maplibre and copy this file next to
+       style.json, e.g.:
+         unzip -o chamonix_test.xcm -d /tmp/chamonix_unzipped
+         cp preview.html /tmp/chamonix_unzipped/maplibre/
+    2. Serve that directory over HTTP (browsers block XHR/fetch on
+       file:// origins, and the bundle's style.json points at offline
+       mbtiles:// URLs a plain static server can't resolve anyway):
+         cd /tmp/chamonix_unzipped/maplibre && python3 -m http.server 8080
+    3. Open http://localhost:8080/preview.html
+       (optionally with ?lat=..&lon=..&zoom=.. to recenter - defaults
+       below match the validated Chamonix test bundle)
+
+  This page fetches the bundle's real style.json as-is and only rewrites
+  each mbtiles://./<name>.mbtiles source to the flat
+  tiles/<name>/{z}/{x}/{y}.<ext> preview tree mapgen builds alongside it
+  (see maplibre.py's __unpack_flat_tiles()) - everything else (layers,
+  paint, sprite, glyphs) is exactly what XCSoar would ship.
+-->
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>mapgen MapLibre bundle preview</title>
+  <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" />
+  <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    #error {
+      position: absolute; top: 1em; left: 1em; right: 1em; z-index: 1;
+      font: 14px/1.4 sans-serif; background: #fff3f3; color: #900;
+      border: 1px solid #900; border-radius: 4px; padding: 0.75em 1em;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="error"></div>
+  <div id="map"></div>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const center = [
+      parseFloat(params.get("lon")) || 6.87,
+      parseFloat(params.get("lat")) || 45.92,
+    ];
+    const zoom = parseFloat(params.get("zoom")) || 11;
+
+    fetch("style.json")
+      .then((r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status + " fetching style.json");
+        return r.json();
+      })
+      .then((style) => {
+        for (const source of Object.values(style.sources || {})) {
+          const match = /mbtiles:\/\/\.\/([^/]+)\.mbtiles$/.exec(source.url || "");
+          if (!match) continue;
+          const name = match[1]; // e.g. "basemap" or "hillshade"
+          const ext = source.type === "raster-dem" ? "png" : "pbf";
+          delete source.url;
+          source.tiles = ["tiles/" + name + "/{z}/{x}/{y}." + ext];
+        }
+
+        const map = new maplibregl.Map({ container: "map", style, center, zoom });
+        map.addControl(new maplibregl.NavigationControl());
+        map.addControl(new maplibregl.ScaleControl());
+      })
+      .catch((err) => {
+        const box = document.getElementById("error");
+        box.style.display = "block";
+        box.textContent =
+          "Could not load the bundle: " + err.message +
+          " - serve this page from inside the unzipped maplibre/ folder" +
+          " (next to style.json), e.g. `python3 -m http.server 8080`.";
+      });
+  </script>
+</body>
+</html>
