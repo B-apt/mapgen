@@ -73,6 +73,27 @@ _CMD_GDAL2TILES = "gdal2tiles.py"
 DEFAULT_MIN_ZOOM = 0
 DEFAULT_MAX_ZOOM = 14
 
+# Baking hillshade tiles at a deeper zoom than the source DEM's native
+# resolution supports doesn't add real detail - it just reprojects the
+# same coarse source grid into a much finer output grid, and every
+# source-pixel boundary becomes a visible blocky/terraced step (a dense
+# grid of horizontal/vertical lines across the hillshade - an inherent
+# property of the source resolution, not a resampling bug). See
+# __hillshade_max_zoom() for how the cutoff is derived from whatever DEM
+# tiles are actually in use, so it adapts automatically if/when
+# finer-resolution data (e.g. Sonny's 1" product, vs. today's 3" SRTM/
+# Sonny tiles - see docs/DATA_SOURCES.md) gets added to the cache.
+# Meters per arcsecond along a meridian, used to convert a DEM tile's
+# arcsecond spacing into a Mercator zoom level (see __hillshade_max_zoom).
+_METERS_PER_ARCSEC = 30.87
+# EPSG:3857 ground resolution (m/px) at zoom 0 (2*pi*6378137 / 256). Divide
+# by 2**z for the resolution of any zoom level - see __build_hillshade_tiles()
+# and __hillshade_max_zoom().
+_MERCATOR_ZOOM0_RESOLUTION = 156543.03392
+# One extra zoom level of headroom beyond the exact resolution-match
+# cutoff - a little extra context without the worst of the terracing.
+_HILLSHADE_ZOOM_HEADROOM = 1
+
 # Global, job-independent source files the default Planetiler OpenMapTiles
 # profile needs in addition to the regional OSM extract (low-zoom water/
 # lake rendering). Same "operator pre-fetches once, jobs never touch the
@@ -146,15 +167,31 @@ class MapLibreBundle(object):
             )
         )
 
+        # The hillshade layer is capped independently of (and typically
+        # lower than) the vector layer's max_zoom, based on the actual
+        # resolution of the DEM tiles found above - see
+        # __hillshade_max_zoom(). Legibility of roads/labels isn't limited
+        # by DEM resolution, but baking hillshade tiles deeper than the
+        # source DEM supports just produces visible terracing, not real
+        # detail.
+        hillshade_max_zoom = self.__hillshade_max_zoom(dem_tiles, max_zoom)
+        print(
+            "Hillshade capped at zoom {} (requested {})".format(
+                hillshade_max_zoom, max_zoom
+            )
+        )
+
         os.makedirs(self.__bundle_dir, exist_ok=True)
 
         pbf_extract = self.__extract_osm(bounds)
         self.__build_vector_tiles(pbf_extract, bounds, min_zoom, max_zoom)
 
-        self.__build_hillshade_tiles(dem_tiles, hillshade_bounds, min_zoom, max_zoom)
+        self.__build_hillshade_tiles(
+            dem_tiles, hillshade_bounds, min_zoom, hillshade_max_zoom
+        )
 
         self.__copy_static_assets()
-        self.__write_style_json(name, max_zoom)
+        self.__write_style_json(name, max_zoom, hillshade_max_zoom)
 
         if also_unpack_flat_tiles:
             self.__unpack_flat_tiles()
@@ -400,6 +437,51 @@ class MapLibreBundle(object):
         )
         return hillshade_bounds, found_paths, found_sources
 
+    @staticmethod
+    def __detect_dem_resolution_arcsec(dem_tiles):
+        """
+        .hgt files have no header - GDAL's SRTMHGT driver (and everyone
+        else) infers the grid size purely from file size: 1201x1201
+        samples for a 3-arcsecond tile, 3601x3601 for 1-arcsecond. Reading
+        that back per-job (rather than hardcoding "3\"") means
+        __hillshade_max_zoom() adapts automatically once finer-resolution
+        tiles (e.g. Sonny's 1" product) show up in the cache, with no code
+        change needed.
+
+        Returns the coarsest (largest arcsec/pixel = lowest resolution)
+        spacing among the tiles actually used, since a mix of resolutions
+        is only ever as good as its worst tile.
+        """
+        import rasterio
+
+        spacings = []
+        for path in dem_tiles:
+            try:
+                with rasterio.open(path) as src:
+                    spacings.append(3600.0 / src.width)
+            except Exception:
+                continue
+        return max(spacings) if spacings else 3.0  # conservative fallback
+
+    @classmethod
+    def __hillshade_max_zoom(cls, dem_tiles, requested_max_zoom):
+        """
+        The Mercator zoom level at which one output pixel matches one DEM
+        source pixel: solving
+            156543m * cos(lat) / 2**z == (arcsec_per_pixel * _METERS_PER_ARCSEC) * cos(lat)
+        for z - the cos(lat) factors cancel (both the Mercator pixel size
+        and the meters-per-arcsecond step scale with cos(lat) the same
+        way), so this cutoff is essentially latitude-independent. Beyond
+        it, hillshade tiles are just upsampled/reprojected copies of the
+        same coarse grid - see the module-level comment above
+        _METERS_PER_ARCSEC for what that looks like.
+        """
+        arcsec_per_pixel = cls.__detect_dem_resolution_arcsec(dem_tiles)
+        meters_per_pixel = arcsec_per_pixel * _METERS_PER_ARCSEC
+        native_zoom = math.log2(_MERCATOR_ZOOM0_RESOLUTION / meters_per_pixel)
+        cap = math.ceil(native_zoom) + _HILLSHADE_ZOOM_HEADROOM
+        return min(requested_max_zoom, cap)
+
     def __build_hillshade_tiles(self, dem_tiles, bounds, min_zoom, max_zoom):
         """
         Turns the DEM tiles __find_dem_tiles() located into a
@@ -420,7 +502,32 @@ class MapLibreBundle(object):
             merged_vrt, clipped_tif,
         ])
 
-        terrain_rgb_tif = self.__pack_terrain_rgb(clipped_tif)
+        # Reproject WGS84 -> Web Mercator ONCE here, on the raw elevation,
+        # rather than warping the packed Terrain-RGB bytes (as before) or
+        # letting gdal2tiles reproject per output tile. WGS84 degrees are
+        # non-square in meters (latitude-dependent) while Mercator meters
+        # are square, so that warp has no clean 1:1 or power-of-2 scale
+        # ratio - nearest-neighbor at a fractional ratio has to duplicate
+        # some source rows/columns and skip others to keep pace, which is
+        # exactly the dense line grid seen in the rendered hillshade
+        # (confirmed by direct pixel inspection: ~19% of rows were exact
+        # duplicates of their neighbor after that warp, 0% before it).
+        # Elevation is continuous, so bilinear is safe here (unlike on the
+        # packed bytes, where blending would corrupt the decoded value);
+        # the explicit -tr pins the output resolution to exactly this zoom
+        # level's Mercator pixel size, so gdal2tiles' own "near" resampling
+        # below only ever does exact-power-of-2 overview decimation.
+        dem_3857 = os.path.join(self.__dir_temp, "dem_3857.tif")
+        mercator_res = _MERCATOR_ZOOM0_RESOLUTION / (2 ** max_zoom)
+        subprocess.check_call([
+            _CMD_GDALWARP,
+            "-t_srs", "EPSG:3857",
+            "-tr", str(mercator_res), str(mercator_res),
+            "-r", "bilinear",
+            clipped_tif, dem_3857,
+        ])
+
+        terrain_rgb_tif = self.__pack_terrain_rgb(dem_3857)
 
         raster_dir = os.path.join(self.__dir_temp, "hillshade_png")
         processes = max(1, min(4, os.cpu_count() or 1))
@@ -430,6 +537,18 @@ class MapLibreBundle(object):
             "--xyz",
             "--webviewer=none",
             "--processes={}".format(processes),
+            # Terrain-RGB packs one elevation value across 3 bytes (see
+            # __pack_terrain_rgb) - any resampling that blends pixels
+            # (gdal2tiles defaults to "average") mixes R/G/B channels
+            # independently and produces a bogus decoded elevation at
+            # every blended pixel. Nearest-neighbor never blends two
+            # Terrain-RGB pixels together - and since terrain_rgb_tif is
+            # already at zoom `max_zoom`'s exact Mercator resolution (see
+            # above), gdal2tiles' base-zoom tiles are a plain crop and
+            # every overview level below it is an exact power-of-2
+            # decimation, so nearest-neighbor here has no fractional-ratio
+            # aliasing left to introduce.
+            "--resampling=near",
             terrain_rgb_tif, raster_dir,
         ])
 
@@ -437,7 +556,38 @@ class MapLibreBundle(object):
         self.__pack_xyz_to_mbtiles(raster_dir, mbtiles_path, "png")
 
     @staticmethod
-    def __pack_terrain_rgb(clipped_tif):
+    def __smooth_elevation(elevation, iterations=2):
+        """
+        SRTM (and to a lesser extent other radar/photogrammetry-derived
+        DEMs) has well-documented small-scale noise - individual pixels
+        a few meters off from their neighbors, well within SRTM's normal
+        vertical error margin but highly visible once run through a
+        gradient-based hillshade shader (MapLibre's included), which
+        amplifies every single-pixel bump into a speckle/line pattern.
+        This survives regardless of resampling method or zoom level,
+        since it's a property of the source data, not of how it's tiled.
+
+        A light repeated 3x3 box average (edge-replicated so the output
+        keeps the same shape) suppresses this at the ~1-2 pixel scale
+        while leaving real terrain features - ridgelines, valleys, which
+        span many pixels - clearly intact. Applied once here (before
+        RGB packing/tiling), every zoom level benefits consistently
+        rather than needing to be smoothed separately.
+        """
+        import numpy as np
+
+        smoothed = elevation
+        for _ in range(iterations):
+            padded = np.pad(smoothed, 1, mode="edge")
+            smoothed = (
+                padded[0:-2, 0:-2] + padded[0:-2, 1:-1] + padded[0:-2, 2:]
+                + padded[1:-1, 0:-2] + padded[1:-1, 1:-1] + padded[1:-1, 2:]
+                + padded[2:, 0:-2] + padded[2:, 1:-1] + padded[2:, 2:]
+            ) / 9.0
+        return smoothed
+
+    @staticmethod
+    def __pack_terrain_rgb(elevation_tif):
         """
         Packs elevation into the Mapbox/MapLibre Terrain-RGB convention:
             height = -10000 + (R * 256*256 + G * 256 + B) * 0.1
@@ -448,11 +598,13 @@ class MapLibreBundle(object):
         import numpy as np
         import rasterio
 
-        dir_temp = os.path.dirname(clipped_tif)
+        dir_temp = os.path.dirname(elevation_tif)
         out_tif = os.path.join(dir_temp, "terrain_rgb.tif")
-        with rasterio.open(clipped_tif) as src:
+        with rasterio.open(elevation_tif) as src:
             elevation = src.read(1).astype(np.float64)
             profile = src.profile
+
+        elevation = MapLibreBundle.__smooth_elevation(elevation)
 
         value = np.clip((elevation + 10000.0) / 0.1, 0, 256**3 - 1)
         value = value.astype(np.uint32)
@@ -538,13 +690,20 @@ class MapLibreBundle(object):
 
     # ---- style.json -----------------------------------------------------
 
-    def __write_style_json(self, name, max_zoom):
+    def __write_style_json(self, name, max_zoom, hillshade_max_zoom):
         template_path = os.path.join(self.__dir_static, "style.json.tmpl")
         style = json.loads(slurp(template_path))
         style["name"] = name
         for layer in style.get("layers", []):
             if layer.get("source") == "openmaptiles":
                 layer.setdefault("maxzoom", max_zoom)
+        for source in style.get("sources", {}).values():
+            if source.get("type") == "raster-dem":
+                # Declares where the actually-generated tile pyramid stops,
+                # so MapLibre overzooms (reuses + GPU-upsamples the deepest
+                # tile) past this instead of requesting nonexistent deeper
+                # hillshade tiles - see __hillshade_max_zoom().
+                source["maxzoom"] = hillshade_max_zoom
         spew(os.path.join(self.__bundle_dir, "style.json"),
              json.dumps(style, indent=2))
 
