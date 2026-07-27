@@ -84,6 +84,7 @@ Nothing above ever makes a network call at XCSoar runtime:
 | `mapgen_patch/bin/generate-maps.diff` | wires `--maplibre` into the existing batch-build script (verified against the real file) |
 | `mapgen_patch/bin/mapgen-cli.md` | shape of the equivalent change to the interactive `bin/mapgen` CLI (illustrative — see note inside) |
 | `style/style.json.tmpl` | the MapLibre style template written into every bundle |
+| `hypsometric-restyle/` | how the terrain got elevation colour *and* kept its relief detail: measured colour ramp, hillshade tuning, and the render-compare tooling |
 | `scripts/build_test_area.sh` | orchestrates a full test build for a small French Alps area |
 | `docs/DATA_SOURCES.md` | where to freely get high-resolution elevation + imagery + vector data for the French Alps (and elsewhere) |
 | `docs/GENERATE_TEST_BUNDLE.md` | step-by-step: produce and sanity-check a real test bundle |

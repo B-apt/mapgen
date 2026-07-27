@@ -31,7 +31,7 @@ Dockerfile/dependency changes need `docker compose build`.
 ## 1. Fetch the raw sources (once, into the shared data cache)
 
 The data volume (`mapgen-data`) is bind-mounted from
-`/home/bapt/.xcsoar_mapgen/mapgen-data` and appears as `/opt/mapgen/data`
+`/home/my-user/.xcsoar_mapgen/mapgen-data` and appears as `/opt/mapgen/data`
 inside the container - this is the same cache `add_terrain()`'s SRTM
 downloader already uses, just with a few new subdirectories:
 
@@ -91,13 +91,13 @@ volume that's already mounted):
 
 ```bash
 # style template
-cp style/style.json.tmpl /home/bapt/.xcsoar_mapgen/mapgen-data/maplibre-static/style.json.tmpl
+cp style/style.json.tmpl /home/my-user/.xcsoar_mapgen/mapgen-data/maplibre-static/style.json.tmpl
 
 # glyphs: prebuilt, OFL-licensed PBF ranges (generated ahead of time with
 # node-fontnik by the openmaptiles/fonts project) - avoids needing a glyph
 # generator toolchain in the image at all
 curl -L -o noto-sans.zip https://github.com/openmaptiles/fonts/releases/download/v2.0/noto-sans.zip
-unzip -j noto-sans.zip 'Noto Sans Regular/*' -d /home/bapt/.xcsoar_mapgen/mapgen-data/maplibre-static/glyphs/'Noto Sans Regular'
+unzip -j noto-sans.zip 'Noto Sans Regular/*' -d /home/my-user/.xcsoar_mapgen/mapgen-data/maplibre-static/glyphs/'Noto Sans Regular'
 
 # sprites: CC0 Maki icon set, built with spreet (already in the image)
 curl -L -o maki.zip https://github.com/mapbox/maki/archive/refs/heads/main.zip

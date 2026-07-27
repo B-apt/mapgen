@@ -10,7 +10,7 @@
     "openmaptiles": {
       "type": "vector",
       "url": "mbtiles://./basemap.mbtiles",
-      "attribution": "\u00a9 OpenStreetMap contributors"
+      "attribution": "© OpenStreetMap contributors"
     },
     "terrain": {
       "type": "raster-dem",
@@ -29,29 +29,96 @@
       "paint": { "background-color": "#f2efe9" }
     },
     {
+      "//": "Hypsometric tint. MUST stay below 'hillshade': the pair is the whole",
+      "//2": "trick - colour-relief alone loses all terrain definition, hillshade",
+      "//3": "alone is monochrome. Stops are metres AMSL, read off the same",
+      "//4": "raster-dem source the hillshade uses. See ../hypsometric-restyle/",
+      "//5": "README.md for how these values were measured.",
+      "id": "color-relief",
+      "type": "color-relief",
+      "source": "terrain",
+      "paint": {
+        "color-relief-opacity": 1,
+        "color-relief-color": [
+          "interpolate", ["linear"], ["elevation"],
+          -200, "rgb(94,136,70)",
+          100, "rgb(102,142,74)",
+          200, "rgb(116,152,82)",
+          300, "rgb(132,165,90)",
+          400, "rgb(152,179,101)",
+          500, "rgb(176,196,113)",
+          600, "rgb(200,213,126)",
+          700, "rgb(224,231,139)",
+          800, "rgb(242,243,148)",
+          900, "rgb(228,222,136)",
+          1000, "rgb(210,197,120)",
+          1100, "rgb(196,176,107)",
+          1200, "rgb(184,159,96)",
+          1300, "rgb(172,141,84)",
+          1400, "rgb(161,126,75)",
+          1500, "rgb(150,112,66)",
+          1600, "rgb(142,104,64)",
+          1700, "rgb(139,102,68)",
+          1800, "rgb(141,108,78)",
+          1900, "rgb(142,114,88)",
+          2000, "rgb(145,124,105)",
+          2100, "rgb(149,132,120)",
+          2200, "rgb(153,141,133)",
+          2300, "rgb(157,149,144)",
+          2400, "rgb(161,156,153)",
+          2500, "rgb(165,163,161)",
+          2600, "rgb(170,169,168)",
+          2700, "rgb(176,175,175)",
+          2800, "rgb(182,182,182)",
+          2900, "rgb(187,187,187)",
+          3000, "rgb(191,191,191)",
+          3200, "rgb(199,199,199)",
+          3400, "rgb(207,207,207)",
+          3600, "rgb(215,215,215)",
+          4000, "rgb(226,226,226)",
+          5000, "rgb(238,238,238)"
+        ]
+      }
+    },
+    {
+      "//": "Shadow/highlight are deliberately semi-transparent so the tint below",
+      "//2": "shows through instead of being painted over. Exaggeration has to ramp",
+      "//3": "with zoom: MapLibre differentiates the DEM in texture space, so the",
+      "//4": "same real slope yields a smaller derivative the further you zoom in.",
+      "//5": "NOTE: in MapLibre Native hillshade-shadow-color/-highlight-color are",
+      "//6": "array<color> (up to 4 lights), unlike MapLibre GL JS. A zoom",
+      "//7": "expression on them fails to parse ('Expected array<color> but found",
+      "//8": "string instead') and silently disables the layer - keep them strings.",
       "id": "hillshade",
       "type": "hillshade",
       "source": "terrain",
       "paint": {
-        "hillshade-shadow-color": "#5b524a",
-        "hillshade-highlight-color": "#ffffff",
-        "hillshade-exaggeration": 0.6
+        "hillshade-method": "combined",
+        "hillshade-exaggeration": [
+          "interpolate", ["linear"], ["zoom"],
+          7, 0.25, 10, 0.4, 12, 1.05, 14, 1.7
+        ],
+        "hillshade-shadow-color": "rgba(0,0,0,0.72)",
+        "hillshade-highlight-color": "rgba(255,255,255,0.45)",
+        "hillshade-accent-color": "rgba(0,0,0,0)",
+        "hillshade-illumination-direction": 335,
+        "hillshade-illumination-altitude": 45,
+        "hillshade-illumination-anchor": "map"
       }
-    },
-    {
-      "id": "landcover-wood",
-      "type": "fill",
-      "source": "openmaptiles",
-      "source-layer": "landcover",
-      "filter": ["==", ["get", "class"], "wood"],
-      "paint": { "fill-color": "#c8dcb4", "fill-opacity": 0.5 }
     },
     {
       "id": "water",
       "type": "fill",
       "source": "openmaptiles",
       "source-layer": "water",
-      "paint": { "fill-color": "#a9cbdf" }
+      "paint": { "fill-color": "#6ea8c8" }
+    },
+    {
+      "id": "waterway",
+      "type": "line",
+      "source": "openmaptiles",
+      "source-layer": "waterway",
+      "paint": { "line-color": "#6ea8c8", "line-width": 1 }
     },
     {
       "id": "roads-major",
@@ -62,19 +129,40 @@
       "paint": { "line-color": "#e8a45c", "line-width": 1.5 }
     },
     {
-      "id": "roads-minor",
-      "type": "line",
+      "id": "mountain-peaks",
+      "type": "symbol",
       "source": "openmaptiles",
-      "source-layer": "transportation",
-      "filter": ["in", ["get", "class"], ["literal", ["secondary", "tertiary", "minor"]]],
-      "minzoom": 11,
-      "paint": { "line-color": "#ffffff", "line-width": 0.8 }
+      "source-layer": "mountain_peak",
+      "filter": ["has", "name"],
+      "minzoom": 9,
+      "layout": {
+        "symbol-sort-key": ["get", "rank"],
+        "icon-image": "mountain",
+        "icon-size": 0.8,
+        "icon-allow-overlap": false,
+        "text-field": [
+          "case",
+          ["has", "ele"],
+          ["concat", ["get", "name"], "\n", ["to-string", ["round", ["get", "ele"]]], " m"],
+          ["get", "name"]
+        ],
+        "text-font": ["Noto Sans Regular"],
+        "text-size": 11,
+        "text-anchor": "top",
+        "text-offset": [0, 0.6]
+      },
+      "paint": {
+        "text-color": "#5b3a29",
+        "text-halo-color": "#ffffff",
+        "text-halo-width": 1.2
+      }
     },
     {
       "id": "place-labels",
       "type": "symbol",
       "source": "openmaptiles",
       "source-layer": "place",
+      "filter": ["in", ["get", "class"], ["literal", ["city", "town"]]],
       "layout": {
         "text-field": ["get", "name"],
         "text-font": ["Noto Sans Regular"],
