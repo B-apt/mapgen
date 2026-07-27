@@ -120,15 +120,12 @@ shadow/highlight/exaggeration sweep that picked the current values.
   boundaries once hillshade contrast is raised. They show up with *both* the
   shipped 3-arcsec bundle and freshly built 1-arcsec tiles, so this is not a
   tiling bug in `maplibre.py` — see
-  `images/known_issue_dem_tile_seams.png` and the investigation prompt in the
-  XCSoar checkout (`prompts/prompt_maplibre_dem_tile_seams.md`).
-- **DEM resolution.** The colour work above is independent of DEM resolution,
-  but the reference's fine texture is not: see the note in
-  `../docs/DATA_SOURCES.md` and `__hillshade_max_zoom()`. The bundle shipped
-  so far was built from 3-arcsec SRTM (`data/dem3/`) and caps at zoom 12,
-  even though 1-arcsec Sonny tiles covering the same area are already in
-  `data/dem/`. Rebuilding from those is the single biggest remaining lever on
-  sharpness. Watch out that `__detect_dem_resolution_arcsec()` returns the
-  *coarsest* spacing among all tiles found **including the best-effort padded
-  ring**, so one stray 3-arcsec neighbour drags the whole bundle back to
-  zoom 12.
+  `images/known_issue_dem_tile_seams.png` and the investigation prompt 
+  (`prompt_maplibre_dem_tile_seams.md`).
+- **DEM zoom cap.** The colour work above is independent of DEM resolution,
+  but the reference's fine texture is not. Bundles built through the web
+  frontend cap at zoom 12 because of `server/config.py`'s
+  `"maplibre_max_zoom": 12`, *not* because of the DEM — measurement confirms
+  the shipped bundle already used the 1-arcsec Sonny tiles from `data/dem/`
+  (`corr(bundle − 3", 1" − 3") = 0.905`). Raising that cap is the cheapest
+  remaining lever on sharpness.

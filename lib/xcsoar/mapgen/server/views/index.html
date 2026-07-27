@@ -23,17 +23,36 @@
   <label>Options:</label>
   <div class="box">
     <input type="checkbox" name="welt2000" id="welt2000"/>
-    <label for="highres">Include the <a href="https://github.com/XCSoar/xcsoar-data-content/tree/master/waypoints">XCSoar Waypoint Database</a></label><br/>
-    <input type="checkbox" name="highres" id="highres" value="1"/>
-    <label for="highres">High resolution terrain (3 arcseconds per pixel instead of 9)</label><br/>
+    <label for="welt2000">Include the <a href="https://github.com/XCSoar/xcsoar-data-content/tree/master/waypoints">XCSoar Waypoint Database</a></label><br/>
+    <hr/>
+    <label for="dem_resolution" style="font-size: 10pt;">Terrain resolution:</label><br/>
+    <select name="dem_resolution" id="dem_resolution">
+      <option value="9" selected="selected">Standard - 9 arcsec grid, from 3 arcsec elevation data</option>
+      <option value="3">High - 3 arcsec grid, from 3 arcsec elevation data</option>
+      <option value="1">Maximum - 3 arcsec grid, from 1 arcsec elevation data</option>
+    </select><br/>
+    <em style="font-size: 10pt;">"Maximum" reads a finer elevation dataset that we hold only for
+    <strong>part of Europe</strong> (roughly France and its neighbours) - it is curated by hand and cannot be
+    downloaded on demand. Outside that area there is no 1 arcsec data at all, so choose what should happen
+    when some of your selected area is not covered. "Standard" and "High" use the global 3 arcsec dataset
+    and are available everywhere.</em><br/>
+    <label for="dem_missing_policy" style="font-size: 10pt;">If 1 arcsec data is missing:</label><br/>
+    <select name="dem_missing_policy" id="dem_missing_policy">
+      <option value="fallback" selected="selected">Fill the gaps with 3 arcsec data and carry on</option>
+      <option value="fail">Stop and tell me which areas are missing</option>
+    </select><br/>
+    <em style="font-size: 10pt;">Either way, the generated map contains a <code>dem_provenance.txt</code>
+    listing exactly which elevation data each part of it was built from.</em>
+    <hr/>
     <input type="checkbox" name="compressed" id="compressed"/>
     <label for="compressed">Compressed topography (smaller filesize, but slower)</label><br/>
     <input type="checkbox" name="maplibre" id="maplibre"/>
     <label for="maplibre">Include an offline MapLibre visual basemap (experimental, adds build time)</label><br/>
     <em style="font-size: 10pt;">Note: the basemap's hillshade layer is only as large as our elevation data
-    coverage allows - if your selected bounds reach outside that coverage, the hillshade is silently
-    cropped to whatever is available (or omitted entirely if there is none), while the rest of the map
-    is built normally.</em>
+    coverage allows - if your selected bounds reach outside that coverage, the hillshade is cropped to
+    whatever is available (or omitted entirely if there is none), while the rest of the map is built
+    normally. The crop is recorded in <code>dem_provenance.txt</code> inside the map, so you can tell
+    what you got.</em>
     <hr/>
     <span style="font-size: 10pt;">Level of detail:</span><br/>
     <input type="radio" name="level_of_detail" value="3" id="radio_lod3" checked="checked"/>

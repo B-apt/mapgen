@@ -9,6 +9,12 @@ from xcsoar.mapgen.topology import shapefiles
 from xcsoar.mapgen.georect import GeoRect
 from xcsoar.mapgen.filelist import FileList
 from xcsoar.mapgen.downloader import Downloader
+from xcsoar.mapgen.terrain.dem_cache import (
+    AUTO_ARCSEC,
+    DEFAULT_ARCSEC,
+    DEFAULT_POLICY,
+    DemCache,
+)
 from xcsoar.mapgen.util import check_commands, spew
 
 check_commands()
@@ -32,6 +38,16 @@ class Generator:
 
         self.__bounds = None
         self.__files = FileList()
+
+        # One cache for the whole job, shared by terrain.jp2 and the
+        # MapLibre hillshade. Sharing it is the point: those two used to
+        # locate DEM tiles independently, with different conventions and
+        # different preferences, so a single map could be built from two
+        # different source tiers with nothing recording either. Now both
+        # go through here and the provenance report can show them side by
+        # side.
+        self.__dem_cache = DemCache(self.__dir_data, self.__downloader)
+        self.__provenance_sections = []
 
     def add_information_file(self, name, author="unknown"):
         """
@@ -136,7 +152,21 @@ author: {author}
             )
         )
 
-    def add_terrain(self, arcseconds_per_pixel=9.0, bounds=None):
+    def add_terrain(
+        self,
+        arcseconds_per_pixel=9.0,
+        bounds=None,
+        dem_arcsec=DEFAULT_ARCSEC,
+        dem_missing_policy=DEFAULT_POLICY,
+    ):
+        """
+        arcseconds_per_pixel: output spacing of terrain.jp2 (9 or 3).
+        dem_arcsec:           source DEM tier to prefer (1 or 3), or
+                              AUTO_ARCSEC for best-available-per-cell.
+
+        These are independent axes. The old single `resolution` argument
+        was only ever the first one, despite reading like the second.
+        """
         print("Adding terrain...")
 
         if not bounds:
@@ -146,9 +176,86 @@ author: {author}
 
         self.__files.extend(
             srtm.create(
-                bounds, arcseconds_per_pixel, self.__downloader, self.__dir_temp
+                bounds,
+                arcseconds_per_pixel,
+                self.__downloader,
+                self.__dir_temp,
+                dem_cache=self.__dem_cache,
+                dem_arcsec=dem_arcsec,
+                dem_missing_policy=dem_missing_policy,
             )
         )
+        self.__provenance_sections.append(
+            self.__terrain_provenance_lines(arcseconds_per_pixel, dem_arcsec,
+                                            dem_missing_policy)
+        )
+
+    def __terrain_provenance_lines(
+        self, arcseconds_per_pixel, dem_arcsec, dem_missing_policy
+    ):
+        report = self.__dem_cache.report("terrain")
+        requested = (
+            "auto (best available per cell)"
+            if dem_arcsec is AUTO_ARCSEC
+            else "{:g} arcsec".format(dem_arcsec)
+        )
+        lines = [
+            "=== DEM provenance (terrain.jp2) ===",
+            "requested: {}     policy: {}".format(requested,
+                                                  dem_missing_policy),
+        ]
+        counts = report.tier_counts()
+        downgraded = set(report.downgraded_cells)
+        if counts:
+            for arcsec in sorted(counts):
+                cells = sorted(
+                    ref.cell
+                    for ref in report.mandatory_refs
+                    if ref.arcsec == arcsec
+                )
+                note = ""
+                cells_downgraded = sorted(set(cells) & downgraded)
+                if cells_downgraded:
+                    note = ", DOWNGRADED: {}".format(
+                        ", ".join(cells_downgraded))
+                lines.append(
+                    "used:      {:g} arcsec  x{:<3} ({}{})".format(
+                        arcsec,
+                        counts[arcsec],
+                        "data/dem, manual" if arcsec == 1.0 else "data/dem3",
+                        note,
+                    )
+                )
+        else:
+            lines.append("used:      nothing")
+        lines.append(
+            "missing:   {}".format(
+                ", ".join(report.missing_cells) or "none")
+        )
+        effective = report.effective_arcsec()
+        lines.append(
+            "output:    terrain.jp2 at {:g} arcsec/pixel{}".format(
+                arcseconds_per_pixel,
+                ""
+                if not effective or arcseconds_per_pixel >= effective
+                else " (clamped up to the {:g}\" source)".format(effective),
+            )
+        )
+        return lines
+
+    def provenance_text(self):
+        """
+        The job's full DEM provenance, one section per consumer.
+
+        Empty until add_terrain()/add_maplibre() have run - it reports
+        what was read, not what was configured, so there is nothing to say
+        before anything has been read.
+        """
+        if not self.__provenance_sections:
+            return ""
+        return "\n\n".join(
+            "\n".join(section) for section in self.__provenance_sections
+        ) + "\n"
 
     def add_welt2000(self, bounds=None):
         print("Adding welt2000 cup waypoints...")
@@ -162,7 +269,16 @@ author: {author}
             welt2000cup.create(self.__dir_data, self.__dir_temp, bounds)
         )
 
-    def add_maplibre(self, dir_static, name="XCSoar map", min_zoom=0, max_zoom=14):
+    def add_maplibre(
+        self,
+        dir_static,
+        name="XCSoar map",
+        min_zoom=0,
+        max_zoom=14,
+        max_zoom_source="default",
+        dem_arcsec=DEFAULT_ARCSEC,
+        dem_missing_policy=DEFAULT_POLICY,
+    ):
         """
         Adds an optional, additive offline MapLibre visual-basemap bundle
         to the map, under a "maplibre/" folder inside the .xcm zip file.
@@ -183,17 +299,44 @@ author: {author}
 
         from xcsoar.mapgen.maplibre import MapLibreBundle, NoDemCoverageError
 
+        bundle = MapLibreBundle(
+            dir_data=self.__dir_data,
+            dir_temp=self.__dir_temp,
+            dir_static=dir_static,
+            dem_cache=self.__dem_cache,
+            dem_arcsec=dem_arcsec,
+            dem_missing_policy=dem_missing_policy,
+        )
         try:
-            bundle_dir = MapLibreBundle(
-                dir_data=self.__dir_data, dir_temp=self.__dir_temp, dir_static=dir_static
-            ).build(self.__bounds, name=name, min_zoom=min_zoom, max_zoom=max_zoom)
+            bundle_dir = bundle.build(
+                self.__bounds,
+                name=name,
+                min_zoom=min_zoom,
+                max_zoom=max_zoom,
+                max_zoom_source=max_zoom_source,
+            )
         except NoDemCoverageError as e:
             # Testing-scale DEM caches (e.g. one country) commonly fall
             # short of an arbitrary requested bbox - skip the bundle
             # rather than failing the whole map job over an optional,
             # purely decorative layer.
+            #
+            # Only ever raised under the "fallback" policy. Under "fail"
+            # the bundle raises a bare DemCoverageError, which is not
+            # caught here and takes the job down as intended - that policy
+            # exists precisely to stop shortfalls being worked around
+            # quietly.
             print("Skipping MapLibre bundle: {}".format(e))
+            self.__provenance_sections.append(
+                [
+                    "=== DEM provenance (MapLibre hillshade) ===",
+                    "skipped: {}".format(e),
+                ]
+            )
             return
+
+        if bundle.provenance():
+            self.__provenance_sections.append(bundle.provenance().lines())
 
         for root, _dirs, files in os.walk(bundle_dir):
             for filename in files:
@@ -205,6 +348,31 @@ author: {author}
                 # them on top just burns CPU for no size win.
                 already_compressed = filename.endswith((".mbtiles", ".png", ".pbf"))
                 self.__files.add(full_path, not already_compressed, arcname=arcname)
+
+    def add_provenance_file(self):
+        """
+        Folds the DEM provenance report into the .xcm as
+        dem_provenance.txt, so the answer to "which elevation data is this
+        map built from?" travels with the file.
+
+        Must be called after add_terrain()/add_maplibre(), since it
+        reports what they actually read. A no-op if neither ran.
+
+        This is deliberately a separate file rather than extra lines in
+        info.txt: info.txt is written up front, before any DEM has been
+        touched, and XCSoar parses it.
+        """
+        text = self.provenance_text()
+        if not text:
+            return
+
+        print()
+        print(text.rstrip())
+        print()
+
+        dst = os.path.join(self.__dir_temp, "dem_provenance.txt")
+        spew(dst, text)
+        self.__files.add(dst, True)
 
     def set_bounds(self, bounds):
         if not isinstance(bounds, GeoRect):

@@ -50,10 +50,19 @@ import sqlite3
 import subprocess
 
 from xcsoar.mapgen.georect import GeoRect
+from xcsoar.mapgen.terrain.dem_cache import (
+    AUTO_ARCSEC,
+    DEFAULT_ARCSEC,
+    DEFAULT_POLICY,
+    POLICY_FAIL,
+    DemCache,
+    DemCoverageError,
+    cell_name,
+)
 from xcsoar.mapgen.util import slurp, spew
 
 
-class NoDemCoverageError(RuntimeError):
+class NoDemCoverageError(DemCoverageError):
     """
     Raised when the requested bounds have zero overlap with the DEM tiles
     available in data/dem/ (Sonny LiDAR) and data/dem3/ (SRTM cache).
@@ -61,6 +70,12 @@ class NoDemCoverageError(RuntimeError):
     maplibre/ folder to the zip rather than failing the whole map job -
     unlike other failures in this module (missing OSM extract, a
     planetiler/gdal crash, ...), which still propagate as hard errors.
+
+    Only ever raised under the "fallback" missing-data policy. Under
+    "fail" the bare DemCoverageError propagates instead, which
+    add_maplibre() does not catch - the whole point of that policy being
+    that a shortfall is an error rather than something to work around
+    quietly.
     """
 
 
@@ -93,6 +108,19 @@ _MERCATOR_ZOOM0_RESOLUTION = 156543.03392
 # One extra zoom level of headroom beyond the exact resolution-match
 # cutoff - a little extra context without the worst of the terracing.
 _HILLSHADE_ZOOM_HEADROOM = 1
+# Passes of the 3x3 box average applied to the Mercator-resampled
+# elevation grid before Terrain-RGB packing - see __smooth_elevation().
+# Named because it materially changes how much of the source DEM's detail
+# survives into the bundle, which makes it a provenance fact rather than
+# an implementation detail: choosing 1-arcsec source data and then
+# smoothing it heavily is self-defeating, and the report should show both
+# numbers together so that is visible.
+_SMOOTHING_ITERATIONS = 2
+# Target bytes for one float32 strip in __pack_terrain_rgb. The smoothing
+# pass keeps a handful of same-sized temporaries alive at once, so peak
+# usage is a small multiple of this - 256 MB per strip keeps the whole
+# step comfortably inside 2 GB regardless of how deep the hillshade goes.
+_PACK_BLOCK_BYTES = 256 * 1024 * 1024
 
 # Global, job-independent source files the default Planetiler OpenMapTiles
 # profile needs in addition to the regional OSM extract (low-zoom water/
@@ -106,6 +134,160 @@ _PLANETILER_AUX_SOURCES = {
 }
 
 
+class _HillshadeProvenance(object):
+    """
+    What the hillshade layer was actually built from.
+
+    This exists because the pipeline previously recorded nothing about DEM
+    provenance, so the only way to find out which elevation tier a shipped
+    .xcm had been built from was forensic analysis of its Terrain-RGB
+    pixels - and an earlier session did exactly that and got it wrong,
+    concluding a 1-arcsec-sourced bundle was 3-arcsec because it capped at
+    zoom 12. The cap in fact came from the web frontend's config.
+    Recording which constraint set the zoom is therefore the single most
+    load-bearing line here.
+    """
+
+    def __init__(
+        self,
+        report,
+        requested_arcsec,
+        policy,
+        requested_bounds,
+        covered_bounds,
+        max_zoom,
+        requested_max_zoom,
+        resolution_cap,
+        effective_arcsec,
+        smoothing_iterations,
+        max_zoom_source,
+    ):
+        self.report = report
+        self.requested_arcsec = requested_arcsec
+        self.policy = policy
+        self.requested_bounds = requested_bounds
+        self.covered_bounds = covered_bounds
+        self.max_zoom = max_zoom
+        self.requested_max_zoom = requested_max_zoom
+        self.resolution_cap = resolution_cap
+        self.effective_arcsec = effective_arcsec
+        self.smoothing_iterations = smoothing_iterations
+        self.max_zoom_source = max_zoom_source
+
+    def __zoom_constraint(self):
+        """
+        Which of the two independent caps actually bound the result. Both
+        are always shown, so "z12" can never again be mistaken for a
+        statement about the source data when it was really a config value.
+        """
+        if self.max_zoom < self.resolution_cap:
+            return (
+                'capped by: {}={}, {:g}" source data would have '
+                "allowed z{}".format(
+                    self.max_zoom_source,
+                    self.requested_max_zoom,
+                    self.effective_arcsec,
+                    self.resolution_cap,
+                )
+            )
+        if self.max_zoom == self.resolution_cap == self.requested_max_zoom:
+            return 'capped by: both source resolution ({:g}") and {}={}'.format(
+                self.effective_arcsec,
+                self.max_zoom_source,
+                self.requested_max_zoom,
+            )
+        return 'capped by: source resolution ({:g}"), {}={} allowed more'.format(
+            self.effective_arcsec,
+            self.max_zoom_source,
+            self.requested_max_zoom,
+        )
+
+    def lines(self):
+        report = self.report
+
+        if self.requested_arcsec is AUTO_ARCSEC:
+            requested = "auto (best available per cell)"
+        else:
+            requested = "{:g} arcsec".format(self.requested_arcsec)
+
+        out = [
+            "=== DEM provenance (MapLibre hillshade) ===",
+            "requested: {}     policy: {}".format(requested, self.policy),
+        ]
+
+        counts = report.tier_counts()
+        if counts:
+            downgraded = set(report.downgraded_cells)
+            for arcsec in sorted(counts):
+                cells = [
+                    ref.cell
+                    for ref in report.mandatory_refs
+                    if ref.arcsec == arcsec
+                ]
+                tier_name = {1.0: "data/dem, manual", 3.0: "data/dem3"}.get(
+                    arcsec, "unknown tier"
+                )
+                note = ""
+                cells_downgraded = sorted(set(cells) & downgraded)
+                if cells_downgraded:
+                    note = ", DOWNGRADED: {}".format(
+                        ", ".join(cells_downgraded)
+                    )
+                out.append(
+                    "used:      {:g} arcsec  x{:<3} ({}{})".format(
+                        arcsec, counts[arcsec], tier_name, note
+                    )
+                )
+        else:
+            out.append("used:      nothing")
+
+        missing = report.missing_cells
+        if missing:
+            handling = (
+                "hillshade extent clipped to available coverage"
+                if self.policy != POLICY_FAIL
+                else "build failed"
+            )
+            out.append(
+                "missing:   {} ({})".format(", ".join(missing), handling)
+            )
+        else:
+            out.append("missing:   none")
+
+        out.append(
+            "hillshade: z0-{}   ({})".format(
+                self.max_zoom, self.__zoom_constraint()
+            )
+        )
+        out.append(
+            "smoothing: {}x 3x3 box on the Mercator-resampled grid".format(
+                self.smoothing_iterations
+            )
+        )
+
+        clipped = self.covered_bounds is not self.requested_bounds
+        out.append(
+            "coverage:  {:g},{:g} -> {:g},{:g}  (= {})".format(
+                self.covered_bounds.left,
+                self.covered_bounds.bottom,
+                self.covered_bounds.right,
+                self.covered_bounds.top,
+                "CLIPPED, requested {:g},{:g} -> {:g},{:g}".format(
+                    self.requested_bounds.left,
+                    self.requested_bounds.bottom,
+                    self.requested_bounds.right,
+                    self.requested_bounds.top,
+                )
+                if clipped
+                else "requested, not clipped",
+            )
+        )
+        return out
+
+    def text(self):
+        return "\n".join(self.lines()) + "\n"
+
+
 class MapLibreBundle(object):
     """
     Builds the optional offline MapLibre bundle for one map job. Call
@@ -114,8 +296,28 @@ class MapLibreBundle(object):
     see Generator.add_maplibre() in generator.py.
     """
 
-    def __init__(self, dir_data, dir_temp, dir_static):
+    def __init__(
+        self,
+        dir_data,
+        dir_temp,
+        dir_static,
+        dem_cache=None,
+        dem_arcsec=DEFAULT_ARCSEC,
+        dem_missing_policy=DEFAULT_POLICY,
+    ):
         """
+        dem_cache:  the job's shared DemCache. Passing the same instance
+                    used for terrain.jp2 is what lets the provenance report
+                    show both consumers side by side - historically they
+                    each open-coded their own lookup with different
+                    conventions and could silently read different source
+                    data for the same map.
+        dem_arcsec: preferred *source* DEM tier (1 or 3), or AUTO_ARCSEC
+                    for "best available per cell" - which is what this
+                    module always did implicitly, and so remains the
+                    default here.
+        dem_missing_policy: see terrain/dem_cache.py.
+
         dir_data:   the shared mapgen data cache (Generator's dir_data -
                     same role as the cache Downloader/srtm.py already use
                     for terrain tiles). The regional OSM extract
@@ -135,14 +337,30 @@ class MapLibreBundle(object):
         self.__dir_temp = dir_temp
         self.__dir_static = dir_static
         self.__bundle_dir = os.path.join(dir_temp, "maplibre")
+        self.__dem_cache = dem_cache or DemCache(dir_data)
+        self.__dem_arcsec = dem_arcsec
+        self.__dem_missing_policy = dem_missing_policy
+        # Filled in by build() so the caller can fold this into the job's
+        # provenance report - see provenance_lines().
+        self.__provenance = None
 
     def build(self, bounds, name="XCSoar map", min_zoom=DEFAULT_MIN_ZOOM,
-              max_zoom=DEFAULT_MAX_ZOOM, also_unpack_flat_tiles=True):
+              max_zoom=DEFAULT_MAX_ZOOM, also_unpack_flat_tiles=False,
+              max_zoom_source="default"):
         """
         bounds:     GeoRect for this job - the same bounds passed to
                     set_bounds()/add_terrain()/add_topology(), so the
                     MapLibre layer always covers exactly the same area as
                     the rest of the map.
+
+        max_zoom_source: human-readable origin of `max_zoom` ("server
+                    config maplibre_max_zoom", "CLI --max-zoom", ...).
+                    Recorded verbatim in the provenance report so it can
+                    say *which* constraint set the final hillshade zoom.
+                    That single line is the one that would have prevented
+                    an earlier session from misattributing a z12 cap to
+                    the DEM resolution when it actually came from the web
+                    frontend's config.
 
         Returns the bundle directory path (dir_temp/maplibre) so the
         caller can fold it into the zip.
@@ -152,18 +370,21 @@ class MapLibreBundle(object):
         # CPU on a vector-tile build that will just be thrown away by the
         # caller (Generator.add_maplibre() catches NoDemCoverageError and
         # skips the whole bundle - see there for why).
-        hillshade_bounds, dem_tiles, dem_sources = self.__find_dem_tiles(bounds)
+        hillshade_bounds, dem_tiles = self.__find_dem_tiles(bounds)
+        report = self.__dem_cache.report("hillshade")
         if hillshade_bounds is not bounds:
             print(
                 "Hillshade extent clipped to available DEM coverage: "
                 "requested {} -> using {}".format(bounds, hillshade_bounds)
             )
         print(
-            "Hillshade DEM tiles: {} found ({} from Sonny LiDAR, {} from "
-            "SRTM cache)".format(
+            "Hillshade DEM tiles: {} found ({})".format(
                 len(dem_tiles),
-                dem_sources.count("sonny"),
-                dem_sources.count("srtm"),
+                ", ".join(
+                    "{:g}\" x{}".format(arcsec, count)
+                    for arcsec, count in sorted(report.tier_counts().items())
+                )
+                or "none",
             )
         )
 
@@ -174,11 +395,28 @@ class MapLibreBundle(object):
         # by DEM resolution, but baking hillshade tiles deeper than the
         # source DEM supports just produces visible terracing, not real
         # detail.
-        hillshade_max_zoom = self.__hillshade_max_zoom(dem_tiles, max_zoom)
+        effective_arcsec = report.effective_arcsec()
+        hillshade_max_zoom, resolution_cap = self.__hillshade_max_zoom(
+            effective_arcsec, max_zoom
+        )
         print(
-            "Hillshade capped at zoom {} (requested {})".format(
-                hillshade_max_zoom, max_zoom
+            "Hillshade capped at zoom {} (requested {}, {:g}\" source data "
+            "would have allowed {})".format(
+                hillshade_max_zoom, max_zoom, effective_arcsec, resolution_cap
             )
+        )
+        self.__provenance = _HillshadeProvenance(
+            report=report,
+            requested_arcsec=self.__dem_arcsec,
+            policy=self.__dem_missing_policy,
+            requested_bounds=bounds,
+            covered_bounds=hillshade_bounds,
+            max_zoom=hillshade_max_zoom,
+            requested_max_zoom=max_zoom,
+            resolution_cap=resolution_cap,
+            effective_arcsec=effective_arcsec,
+            smoothing_iterations=_SMOOTHING_ITERATIONS,
+            max_zoom_source=max_zoom_source,
         )
 
         os.makedirs(self.__bundle_dir, exist_ok=True)
@@ -192,11 +430,29 @@ class MapLibreBundle(object):
 
         self.__copy_static_assets()
         self.__write_style_json(name, max_zoom, hillshade_max_zoom)
+        self.__write_provenance()
 
         if also_unpack_flat_tiles:
             self.__unpack_flat_tiles()
 
         return self.__bundle_dir
+
+    def provenance(self):
+        """The _HillshadeProvenance for the last build(), or None."""
+        return self.__provenance
+
+    def __write_provenance(self):
+        """
+        Writes the report into the bundle itself, so the answer travels
+        with the .xcm instead of living only in a worker log that is
+        rotated away long before anyone asks which DEM a given map was
+        built from. That is precisely the question that could not be
+        answered about an already-shipped bundle.
+        """
+        spew(
+            os.path.join(self.__bundle_dir, "PROVENANCE.txt"),
+            self.__provenance.text(),
+        )
 
     # ---- OSM extract --------------------------------------------------
 
@@ -320,62 +576,36 @@ class MapLibreBundle(object):
 
     # ---- hillshade / terrain-rgb raster tiles --------------------------
 
-    @staticmethod
-    def __tile_name(lat, lon, upper):
-        ns = "n" if lat >= 0 else "s"
-        ew = "e" if lon >= 0 else "w"
-        name = "{ns}{lat:02}{ew}{lon:03}".format(
-            ns=ns, lat=abs(lat), ew=ew, lon=abs(lon)
-        )
-        return name.upper() if upper else name
-
-    def __locate_dem_tile(self, lat, lon):
-        """
-        Prefers Sonny's LiDAR-derived DTM (data/dem/<NAME>.hgt, uppercase
-        filenames, e.g. "N45E006.hgt") over the plain SRTM cache
-        (data/dem3/<name>.hgt, lowercase, the same cache add_terrain()
-        uses via Downloader) - substantially cleaner over the steep
-        terrain a French Alps test area has. See docs/DATA_SOURCES.md.
-        Returns (path, source) or (None, None) if neither cache has this
-        1-degree tile.
-        """
-        sonny_path = os.path.join(
-            self.__dir_data, "dem", self.__tile_name(lat, lon, True) + ".hgt"
-        )
-        if os.path.exists(sonny_path):
-            return sonny_path, "sonny"
-
-        srtm_path = os.path.join(
-            self.__dir_data, "dem3", self.__tile_name(lat, lon, False) + ".hgt"
-        )
-        if os.path.exists(srtm_path):
-            return srtm_path, "srtm"
-
-        return None, None
-
     def __find_dem_tiles(self, bounds):
         """
-        Independent of add_terrain()/srtm.py (which builds terrain.jp2 and
-        is not touched by this module) - the hillshade layer locates its
-        own DEM tiles so it can prefer Sonny's LiDAR data without changing
-        how terrain.jp2 itself is built.
+        Locates this job's hillshade DEM tiles through the shared DemCache
+        (terrain/dem_cache.py), which is also what add_terrain()/srtm.py
+        now uses. Before that existed, this module open-coded its own
+        lookup - preferring data/dem/ and falling back to data/dem3/ while
+        ignoring the job's requested resolution entirely - and srtm.py
+        open-coded a different one that always used dem3/. The two could
+        therefore build the same map from different source data, and
+        neither recorded which.
 
         "mandatory" tiles are the 1-degree cells overlapping `bounds`
         directly. The wider padded ring (matching srtm.py's own -1/+1
         buffer, for clean edge interpolation) is best-effort only and
-        never affects coverage/clipping decisions.
+        never affects coverage/clipping/resolution decisions - which is
+        why it is passed to locate() with mandatory=False.
 
-        DEM coverage for a testing setup (e.g. one country's worth of
-        Sonny/SRTM tiles) commonly falls short of an arbitrary requested
-        bbox, so this doesn't hard-fail on a partial shortfall: it returns
-        a (possibly) smaller hillshade_bounds clipped to whatever tiles
-        are actually available, intersected with the requested bounds.
-        Only the OSM/vector-tile layer keeps covering the full requested
-        bounds - see build().
+        Under the "fallback" policy, DEM coverage falling short of the
+        requested bbox is not fatal: this returns a (possibly) smaller
+        hillshade_bounds clipped to whatever tiles exist, intersected with
+        the requested bounds, and the shortfall is recorded in the
+        provenance report instead of vanishing into a log line nobody
+        reads. Only the OSM/vector-tile layer keeps covering the full
+        requested bounds - see build().
 
-        Returns (hillshade_bounds, dem_tile_paths, dem_tile_sources).
-        Raises NoDemCoverageError if none of the mandatory tiles are
-        available at all (nothing to clip to).
+        Under "fail", any shortfall - a missing cell, or a cell that could
+        only be satisfied by downgrading to a coarser tier - raises
+        DemCoverageError naming the offending cells.
+
+        Returns (hillshade_bounds, dem_tile_paths).
         """
 
         def needed_tiles(pad):
@@ -393,33 +623,63 @@ class MapLibreBundle(object):
         wanted = needed_tiles(1)
 
         found_paths = []
-        found_sources = []
         found_mandatory = set()
         for lat, lon in wanted:
-            path, source = self.__locate_dem_tile(lat, lon)
-            if path:
-                found_paths.append(path)
-                found_sources.append(source)
-                if (lat, lon) in mandatory:
+            is_mandatory = (lat, lon) in mandatory
+            ref = self.__dem_cache.locate(
+                lat,
+                lon,
+                preferred_arcsec=self.__dem_arcsec,
+                policy=self.__dem_missing_policy,
+                consumer="hillshade",
+                mandatory=is_mandatory,
+            )
+            if ref:
+                found_paths.append(ref.path)
+                if is_mandatory:
                     found_mandatory.add((lat, lon))
-            elif (lat, lon) in mandatory:
+            elif is_mandatory:
                 print(
-                    "Warning: missing DEM tile for hillshade at lat={} "
-                    "lon={}".format(lat, lon)
+                    "Warning: missing DEM tile for hillshade at {}".format(
+                        cell_name(lat, lon)
+                    )
                 )
 
-        if not found_mandatory:
-            raise NoDemCoverageError(
-                "No DEM tiles available for the MapLibre hillshade layer "
-                "anywhere in the requested bounds {}. Checked data/dem/ "
-                "(Sonny LiDAR) and data/dem3/ (SRTM cache) under {}.".format(
-                    bounds, self.__dir_data
-                )
-            )
+        # Total absence is skippable under "fallback" (an optional,
+        # decorative layer should not sink a whole map job) but a hard
+        # error under "fail".
+        self.__dem_cache.raise_if_incomplete(
+            self.__dem_missing_policy,
+            consumer="hillshade",
+            no_coverage_error=(
+                DemCoverageError
+                if self.__dem_missing_policy == POLICY_FAIL
+                else NoDemCoverageError
+            ),
+        )
 
         if found_mandatory == mandatory:
             # Full coverage - no clipping needed.
-            return bounds, found_paths, found_sources
+            return bounds, found_paths
+
+        if self.__dem_missing_policy == POLICY_FAIL:
+            # raise_if_incomplete() above already covers missing cells;
+            # this is belt-and-braces for any clipping path that could
+            # otherwise silently shrink the map under a policy whose whole
+            # point is that shrinking is an error.
+            raise DemCoverageError(
+                "Hillshade coverage {} is short of the requested bounds "
+                "{}: {} unavailable.".format(
+                    sorted(cell_name(lat, lon) for lat, lon in found_mandatory),
+                    bounds,
+                    ", ".join(
+                        sorted(
+                            cell_name(lat, lon)
+                            for lat, lon in mandatory - found_mandatory
+                        )
+                    ),
+                )
+            )
 
         # Partial coverage: clip the hillshade extent to the bounding
         # rectangle of the mandatory cells that ARE covered, intersected
@@ -435,36 +695,10 @@ class MapLibreBundle(object):
             top=min(bounds.top, max(lats) + 1),
             bottom=max(bounds.bottom, min(lats)),
         )
-        return hillshade_bounds, found_paths, found_sources
+        return hillshade_bounds, found_paths
 
     @staticmethod
-    def __detect_dem_resolution_arcsec(dem_tiles):
-        """
-        .hgt files have no header - GDAL's SRTMHGT driver (and everyone
-        else) infers the grid size purely from file size: 1201x1201
-        samples for a 3-arcsecond tile, 3601x3601 for 1-arcsecond. Reading
-        that back per-job (rather than hardcoding "3\"") means
-        __hillshade_max_zoom() adapts automatically once finer-resolution
-        tiles (e.g. Sonny's 1" product) show up in the cache, with no code
-        change needed.
-
-        Returns the coarsest (largest arcsec/pixel = lowest resolution)
-        spacing among the tiles actually used, since a mix of resolutions
-        is only ever as good as its worst tile.
-        """
-        import rasterio
-
-        spacings = []
-        for path in dem_tiles:
-            try:
-                with rasterio.open(path) as src:
-                    spacings.append(3600.0 / src.width)
-            except Exception:
-                continue
-        return max(spacings) if spacings else 3.0  # conservative fallback
-
-    @classmethod
-    def __hillshade_max_zoom(cls, dem_tiles, requested_max_zoom):
+    def __hillshade_max_zoom(effective_arcsec, requested_max_zoom):
         """
         The Mercator zoom level at which one output pixel matches one DEM
         source pixel: solving
@@ -475,12 +709,26 @@ class MapLibreBundle(object):
         it, hillshade tiles are just upsampled/reprojected copies of the
         same coarse grid - see the module-level comment above
         _METERS_PER_ARCSEC for what that looks like.
+
+        Works out to z12 for 3-arcsec source data and z14 for 1-arcsec.
+
+        `effective_arcsec` comes from the provenance report's mandatory
+        cells only. It used to be a max() over every located tile
+        including the best-effort padded ring, so one coarse neighbour a
+        degree outside the requested bounds silently cost the whole bundle
+        a zoom level.
+
+        Returns (max_zoom, resolution_cap) - the second value is what the
+        source resolution alone would have allowed, so the caller can say
+        which of the two constraints actually bound the result rather than
+        leaving it to be guessed at afterwards.
         """
-        arcsec_per_pixel = cls.__detect_dem_resolution_arcsec(dem_tiles)
-        meters_per_pixel = arcsec_per_pixel * _METERS_PER_ARCSEC
+        if not effective_arcsec:
+            effective_arcsec = 3.0  # conservative fallback
+        meters_per_pixel = effective_arcsec * _METERS_PER_ARCSEC
         native_zoom = math.log2(_MERCATOR_ZOOM0_RESOLUTION / meters_per_pixel)
         cap = math.ceil(native_zoom) + _HILLSHADE_ZOOM_HEADROOM
-        return min(requested_max_zoom, cap)
+        return min(requested_max_zoom, cap), cap
 
     def __build_hillshade_tiles(self, dem_tiles, bounds, min_zoom, max_zoom):
         """
@@ -556,7 +804,7 @@ class MapLibreBundle(object):
         self.__pack_xyz_to_mbtiles(raster_dir, mbtiles_path, "png")
 
     @staticmethod
-    def __smooth_elevation(elevation, iterations=2):
+    def __smooth_elevation(elevation, iterations=_SMOOTHING_ITERATIONS):
         """
         SRTM (and to a lesser extent other radar/photogrammetry-derived
         DEMs) has well-documented small-scale noise - individual pixels
@@ -587,7 +835,7 @@ class MapLibreBundle(object):
         return smoothed
 
     @staticmethod
-    def __pack_terrain_rgb(elevation_tif):
+    def __encode_terrain_rgb(elevation):
         """
         Packs elevation into the Mapbox/MapLibre Terrain-RGB convention:
             height = -10000 + (R * 256*256 + G * 256 + B) * 0.1
@@ -596,31 +844,91 @@ class MapLibreBundle(object):
         bands, not the base-256 byte-splitting this encoding needs).
         """
         import numpy as np
-        import rasterio
-
-        dir_temp = os.path.dirname(elevation_tif)
-        out_tif = os.path.join(dir_temp, "terrain_rgb.tif")
-        with rasterio.open(elevation_tif) as src:
-            elevation = src.read(1).astype(np.float64)
-            profile = src.profile
-
-        elevation = MapLibreBundle.__smooth_elevation(elevation)
 
         value = np.clip((elevation + 10000.0) / 0.1, 0, 256**3 - 1)
         value = value.astype(np.uint32)
-        r = (value // (256 * 256)) % 256
-        g = (value // 256) % 256
-        b = value % 256
+        return (
+            ((value >> 16) & 0xFF).astype(np.uint8),
+            ((value >> 8) & 0xFF).astype(np.uint8),
+            (value & 0xFF).astype(np.uint8),
+        )
 
-        # The source Int16 SRTM/HGT profile carries a nodata value
-        # (typically -32768) that is out of range for the uint8 output
-        # band and makes rasterio refuse to open the file for writing;
-        # Terrain-RGB has no nodata concept of its own, so drop it.
-        profile.update(count=3, dtype="uint8", compress="deflate", nodata=None)
-        with rasterio.open(out_tif, "w", **profile) as dst:
-            dst.write(r.astype(np.uint8), 1)
-            dst.write(g.astype(np.uint8), 2)
-            dst.write(b.astype(np.uint8), 3)
+    @staticmethod
+    def __pack_terrain_rgb(elevation_tif, iterations=_SMOOTHING_ITERATIONS):
+        """
+        Smooths and Terrain-RGB-packs the Mercator elevation raster, in
+        horizontal strips rather than all at once.
+
+        Streaming matters here because this raster is sized by the deepest
+        hillshade zoom, and its pixel count grows as 4**zoom: the same
+        area that is a 43 Mpx raster at z12 is 685 Mpx at z14. The
+        previous whole-array implementation read it as float64 and then
+        ran a 9-term neighbour sum over it, so peak memory was well over
+        a dozen full-size copies - ~20 GB for a 1.5x2.4 degree job, which
+        the kernel OOM-killed. A flat max-zoom cap of 12 had been hiding
+        that; it only became reachable once the cap became
+        resolution-derived and 1-arcsec source data allowed z14.
+
+        float32 rather than float64 throughout: elevation is metres and
+        Terrain-RGB quantises to 0.1 m, so float32's ~7 significant
+        digits are far more precision than the encoding can carry.
+
+        Each strip is read with a `iterations`-pixel halo above and below,
+        smoothed, then trimmed back. One box-blur pass propagates one
+        pixel, so a halo equal to the iteration count makes every written
+        row bit-identical to what the whole-array version produced. At the
+        raster's true top and bottom edges the halo is absent and
+        np.pad(mode="edge") replicates as before.
+        """
+        import numpy as np
+        import rasterio
+        from rasterio.windows import Window
+
+        dir_temp = os.path.dirname(elevation_tif)
+        out_tif = os.path.join(dir_temp, "terrain_rgb.tif")
+
+        with rasterio.open(elevation_tif) as src:
+            profile = src.profile
+            # The source Int16 SRTM/HGT profile carries a nodata value
+            # (typically -32768) that is out of range for the uint8 output
+            # band and makes rasterio refuse to open the file for writing;
+            # Terrain-RGB has no nodata concept of its own, so drop it.
+            profile.update(
+                count=3,
+                dtype="uint8",
+                compress="deflate",
+                nodata=None,
+                tiled=True,
+                blockxsize=256,
+                blockysize=256,
+            )
+
+            # Strip height is derived from a memory budget rather than
+            # fixed, so a very wide raster does not quietly reintroduce
+            # the problem this method exists to avoid.
+            bytes_per_row = max(1, src.width * 4)
+            rows = int(_PACK_BLOCK_BYTES // bytes_per_row)
+            rows = max(1, min(rows, src.height))
+
+            with rasterio.open(out_tif, "w", **profile) as dst:
+                for row in range(0, src.height, rows):
+                    count = min(rows, src.height - row)
+                    top = max(0, row - iterations)
+                    bottom = min(src.height, row + count + iterations)
+
+                    elevation = src.read(
+                        1, window=Window(0, top, src.width, bottom - top)
+                    ).astype(np.float32)
+                    elevation = MapLibreBundle.__smooth_elevation(
+                        elevation, iterations
+                    )
+                    elevation = elevation[row - top : row - top + count]
+
+                    window = Window(0, row, src.width, count)
+                    for band, plane in enumerate(
+                        MapLibreBundle.__encode_terrain_rgb(elevation), start=1
+                    ):
+                        dst.write(plane, band, window=window)
 
         return out_tif
 
@@ -735,7 +1043,12 @@ class MapLibreBundle(object):
         cur = conn.cursor()
         cur.execute("SELECT zoom_level, tile_column, tile_row, tile_data "
                     "FROM tiles")
-        for z, x, tms_y, data in cur.fetchall():
+        # Iterated rather than fetchall()'d: the tile count grows as
+        # 4**zoom, so a deep hillshade pyramid is tens of thousands of
+        # blobs and materialising them all at once is another way to run
+        # the worker out of memory - the same failure __pack_terrain_rgb
+        # streams to avoid.
+        for z, x, tms_y, data in cur:
             xyz_y = (2 ** z) - 1 - tms_y
             # Planetiler gzips vector tile blobs inside the mbtiles (per
             # the MBTiles spec, that's normal - a real tile server would

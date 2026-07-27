@@ -76,7 +76,11 @@ This link is valid for 7 days.
 
             if description.use_terrain:
                 job.update_status("Creating terrain files...")
-                generator.add_terrain(description.resolution)
+                generator.add_terrain(
+                    description.resolution,
+                    dem_arcsec=description.dem_arcsec,
+                    dem_missing_policy=description.dem_missing_policy,
+                )
 
             if description.welt2000:
                 job.update_status("Adding welt2000 waypoints...")
@@ -101,7 +105,17 @@ This link is valid for 7 days.
                     dir_static=os.path.join(self.__dir_data, "maplibre-static"),
                     name=description.name,
                     max_zoom=mapgen["maplibre_max_zoom"],
+                    # Named so the provenance report can attribute the
+                    # final hillshade zoom to this config value rather
+                    # than leaving it to be misread as a limit of the DEM.
+                    max_zoom_source="server config maplibre_max_zoom",
+                    dem_arcsec=description.dem_arcsec,
+                    dem_missing_policy=description.dem_missing_policy,
                 )
+
+            # After every add_*() that touches DEM data, since it reports
+            # what they actually read.
+            generator.add_provenance_file()
 
             job.update_status("Creating map file...")
 

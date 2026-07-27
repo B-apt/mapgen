@@ -55,6 +55,56 @@ class Server(object):
             if db != None:
                 db.close()
 
+    # One user-facing select drives two independent axes - see
+    # terrain/dem_cache.py for why they are independent and why conflating
+    # them was the original bug:
+    #
+    #   value -> (terrain.jp2 output spacing, source DEM tier)
+    #
+    # "9" reproduces the historical default exactly (9" output from the
+    # global 3" tier); the old "highres" checkbox is exactly "3".
+    # "1" is the only value that asks for the manually-curated tier, which
+    # is why it is also the only one where the missing-data policy has
+    # anything to decide.
+    __RESOLUTIONS = {
+        "9": (9.0, 3.0),
+        "3": (3.0, 3.0),
+        "1": (3.0, 1.0),
+    }
+    __DEFAULT_RESOLUTION = "9"
+
+    __MISSING_POLICIES = ("fallback", "fail")
+    __DEFAULT_MISSING_POLICY = "fallback"
+
+    @classmethod
+    def __parse_resolution(cls, params):
+        """
+        Validated against the allowed set rather than trusted: this comes
+        straight off a POST body, and both values end up as gdalwarp
+        output spacings and DEM tier lookups.
+        """
+        value = params.get("dem_resolution", cls.__DEFAULT_RESOLUTION)
+        if value not in cls.__RESOLUTIONS:
+            raise ValueError(
+                "Invalid terrain resolution {!r}. Choose one of: {}.".format(
+                    value, ", ".join(sorted(cls.__RESOLUTIONS))
+                )
+            )
+        return cls.__RESOLUTIONS[value]
+
+    @classmethod
+    def __parse_missing_policy(cls, params):
+        value = params.get(
+            "dem_missing_policy", cls.__DEFAULT_MISSING_POLICY
+        )
+        if value not in cls.__MISSING_POLICIES:
+            raise ValueError(
+                "Invalid missing-data policy {!r}. Choose one of: {}.".format(
+                    value, ", ".join(cls.__MISSING_POLICIES)
+                )
+            )
+        return value
+
     @cherrypy.expose
     @view.output("index.html")
     def index(self, **params):
@@ -68,7 +118,13 @@ class Server(object):
         desc = JobDescription()
         desc.name = name
         desc.mail = params["mail"]
-        desc.resolution = 3.0 if "highres" in params else 9.0
+
+        try:
+            desc.resolution, desc.dem_arcsec = self.__parse_resolution(params)
+            desc.dem_missing_policy = self.__parse_missing_policy(params)
+        except ValueError as e:
+            return view.render(error=str(e)) | HTMLFormFiller(data=params)
+
         desc.compressed = "compressed" in params
         desc.welt2000 = "welt2000" in params
         desc.maplibre = "maplibre" in params

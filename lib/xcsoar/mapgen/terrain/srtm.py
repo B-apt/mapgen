@@ -6,6 +6,13 @@ from zipfile import ZipFile, BadZipfile
 
 from xcsoar.mapgen.georect import GeoRect
 from xcsoar.mapgen.filelist import FileList
+from xcsoar.mapgen.terrain.dem_cache import (
+    DEFAULT_ARCSEC,
+    DEFAULT_POLICY,
+    POLICY_FAIL,
+    DemCache,
+    cell_name,
+)
 
 __cmd_gdalwarp = "gdalwarp"
 __use_world_file = True
@@ -15,36 +22,22 @@ __use_world_file = True
 """
 
 
-def __get_tile_name(lat, lon):
-    print("lat: {}, lon: {}".format(lat, lon))
-    if lat >= 0:
-        ns = "n"
-    else:
-        ns = "s"
-        lat = -lat
-
-    if lon >= 0:
-        ew = "e"
-    else:
-        ew = "w"
-        lon = -lon
-
-    return "" + ns + "{0:02}".format(lat) + ew + "{0:03}".format(lon)
-
-
-def __retrieve_tile(downloader, dir_temp, lat, lon):
-    filename = __get_tile_name(lat, lon)
-    hgt_file = downloader.retrieve("dem3/{}.hgt".format(filename))
-    print(("Tile {} found.".format(filename)))
-    return hgt_file
-
-
-def __retrieve_tiles(downloader, dir_temp, bounds):
+def __retrieve_tiles(dem_cache, bounds, dem_arcsec, policy):
     """
     Makes sure the terrain tiles are available at a certain location.
-    @param downloader: Downloader
-    @param dir_temp: Temporary path
+
+    This used to call downloader.retrieve("dem3/...") directly, which meant
+    terrain.jp2 was ALWAYS built from 3-arcsec data no matter what the job
+    asked for - the `arcseconds_per_pixel` argument below is a gdalwarp
+    *output* spacing, not a source tier, so "high resolution terrain"
+    only ever resampled the same 3-arcsec source onto a finer grid.
+    Going through DemCache is what makes a 1-arcsec request actually read
+    1-arcsec data, and makes the choice show up in the provenance report.
+
+    @param dem_cache: DemCache shared with the rest of the job
     @param bounds: Bounding box (GeoRect)
+    @param dem_arcsec: preferred source tier, or AUTO_ARCSEC
+    @param policy: missing-data policy - see terrain/dem_cache.py
     @return: The list of tile files
     """
     if not isinstance(bounds, GeoRect):
@@ -52,26 +45,52 @@ def __retrieve_tiles(downloader, dir_temp, bounds):
 
     print("Retrieving terrain tiles...")
 
-    # Calculate rounded bounds
-    lat_start = int(math.floor(bounds.bottom)) - 1
-    lon_start = int(math.floor(bounds.left)) - 1
-    lat_end = int(math.ceil(bounds.top)) + 1
-    lon_end = int(math.ceil(bounds.right)) + 1
+    def cells(pad):
+        return [
+            (lat, lon)
+            for lat in range(
+                int(math.floor(bounds.bottom)) - pad,
+                int(math.ceil(bounds.top)) + pad,
+            )
+            for lon in range(
+                int(math.floor(bounds.left)) - pad,
+                int(math.ceil(bounds.right)) + pad,
+            )
+        ]
+
+    # The historical -1/+1 ring is kept for clean edge interpolation, but
+    # it is now explicitly best-effort: only cells actually overlapping the
+    # requested bounds count towards coverage and resolution decisions.
+    mandatory = set(cells(0))
 
     tiles = []
-    # Iterate through latitude and longitude in 1 degree interval
-    for lat in range(lat_start, lat_end, 1):
-        for lon in range(lon_start, lon_end, 1):
-            try:
-                tiles.append(__retrieve_tile(downloader, dir_temp, lat, lon))
-            except Exception as e:
-                print(
-                    (
-                        "Failed to retrieve tile for {0:02}/{1:02}: {2}".format(
-                            lat, lon, e
-                        )
-                    )
+    for lat, lon in cells(1):
+        ref = dem_cache.locate(
+            lat,
+            lon,
+            preferred_arcsec=dem_arcsec,
+            policy=policy,
+            consumer="terrain",
+            mandatory=(lat, lon) in mandatory,
+        )
+        if ref:
+            print(
+                "Tile {} found ({:g} arcsec, {}).".format(
+                    ref.cell, ref.arcsec, ref.tier_name
                 )
+            )
+            tiles.append(ref.path)
+        elif (lat, lon) in mandatory:
+            print("Failed to retrieve tile for {}".format(cell_name(lat, lon)))
+
+    # Only "fail" turns a shortfall into an error. Under "fallback" this
+    # stays exactly as lenient as it always was - a bbox with no DEM at
+    # all (an ocean-only selection, say) yields an empty tile list and a
+    # map without terrain, rather than a failed job. The difference from
+    # before is that the shortfall is now recorded in the provenance
+    # report instead of disappearing into a log line.
+    if policy == POLICY_FAIL:
+        dem_cache.raise_if_incomplete(policy, consumer="terrain")
 
     # Return list of available tile files
     return tiles
@@ -224,7 +243,43 @@ def __cleanup(dir_temp):
             os.unlink(os.path.join(dir_temp, file))
 
 
-def create(bounds, arcseconds_per_pixel, downloader, dir_temp):
+def create(
+    bounds,
+    arcseconds_per_pixel,
+    downloader,
+    dir_temp,
+    dem_cache=None,
+    dem_arcsec=DEFAULT_ARCSEC,
+    dem_missing_policy=DEFAULT_POLICY,
+):
+    """
+    Note the two independent axes, which `resolution` used to conflate:
+
+      * dem_arcsec is the *source* tier to read (1" or 3", or AUTO).
+      * arcseconds_per_pixel is the *output* spacing of terrain.jp2.
+
+    Tiles are located before the output grid is sized, so the output can
+    never be asked to carry more detail than the source actually has -
+    resampling 3-arcsec data onto a 1-arcsec grid triples the file size
+    while adding exactly zero information.
+    """
+    dem_cache = dem_cache or DemCache(downloader.dir, downloader)
+
+    # Make sure the tiles are available. Done first: the output spacing
+    # below depends on what was actually found.
+    tiles = __retrieve_tiles(dem_cache, bounds, dem_arcsec, dem_missing_policy)
+    if len(tiles) < 1:
+        return FileList()
+
+    effective_arcsec = dem_cache.report("terrain").effective_arcsec()
+    if effective_arcsec and arcseconds_per_pixel < effective_arcsec:
+        print(
+            "Terrain output spacing clamped from {:g}\" to {:g}\": the "
+            "source DEM is {:g}\" and a finer grid would only interpolate."
+            .format(arcseconds_per_pixel, effective_arcsec, effective_arcsec)
+        )
+        arcseconds_per_pixel = effective_arcsec
+
     # calculate height and width (in pixels) of map from geo coordinates
     px = round((bounds.right - bounds.left) * 3600 / arcseconds_per_pixel)
     py = round((bounds.top - bounds.bottom) * 3600 / arcseconds_per_pixel)
@@ -235,11 +290,6 @@ def create(bounds, arcseconds_per_pixel, downloader, dir_temp):
     # and back to geo coordinates for size
     bounds.right = bounds.left + (px * arcseconds_per_pixel / 3600)
     bounds.bottom = bounds.top - (py * arcseconds_per_pixel / 3600)
-
-    # Make sure the tiles are available
-    tiles = __retrieve_tiles(downloader, dir_temp, bounds)
-    if len(tiles) < 1:
-        return FileList()
 
     try:
         terrain_file = __create(dir_temp, tiles, arcseconds_per_pixel, bounds)

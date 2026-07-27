@@ -9,6 +9,13 @@ from xcsoar.mapgen.util import slurp, spew
 
 
 class JobDescription:
+    # These are CLASS attributes on purpose, not instance attributes set in
+    # an __init__. Jobs are pickled to disk and can sit in the queue across
+    # a deploy; unpickling restores only the instance __dict__, so a job
+    # queued before a new field existed comes back without it. Defining
+    # defaults at class level means those older jobs transparently pick up
+    # the new default instead of dying with an AttributeError in the
+    # worker.
     name = None
     mail = None
     waypoint_file = None
@@ -17,7 +24,16 @@ class JobDescription:
     use_topology = True
     use_terrain = True
     bounds = None
+    # Output spacing of terrain.jp2, in arcseconds per pixel. NOT the
+    # source DEM tier - see dem_arcsec below and terrain/dem_cache.py.
     resolution = 9.0
+    # Source DEM tier to read: 1.0 or 3.0 arcsec. Defaults to 3.0, the
+    # global downloadable tier, so the default job is reproducible on any
+    # worker regardless of which 1-arcsec tiles happen to be cached there.
+    dem_arcsec = 3.0
+    # What to do when a 1-degree cell has no data at the requested tier:
+    # "fallback" (use the next-coarser tier, report it) or "fail".
+    dem_missing_policy = "fallback"
     download_url = None
     compressed = False
     level_of_detail = 3

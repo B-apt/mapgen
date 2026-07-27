@@ -24,7 +24,41 @@ def main():
         dest="resolution",
         type=float,
         default=9.0,
-        help="resolution of the terrain in arcseconds per pixel",
+        help="OUTPUT resolution of terrain.jp2 in arcseconds per pixel. "
+        "This is a gdalwarp output grid spacing, not a choice of source "
+        "data - see --dem-arcsec for that. Clamped up if it would be "
+        "finer than the source DEM actually used.",
+    )
+    parser.add_argument(
+        "--dem-arcsec",
+        dest="dem_arcsec",
+        choices=["auto", "1", "3"],
+        default="3",
+        help="SOURCE elevation data tier to read: 1 arcsec (data/dem, "
+        "curated by hand, partial coverage, cannot be downloaded), 3 "
+        "arcsec (data/dem3, global, downloaded on demand), or auto for "
+        "the best available per 1-degree cell. Default: 3, so the same "
+        "command produces the same data on any machine.",
+    )
+    parser.add_argument(
+        "--dem-missing-policy",
+        dest="dem_missing_policy",
+        choices=["fallback", "fail"],
+        default="fallback",
+        help="what to do when a 1-degree cell has no data at the tier "
+        "given by --dem-arcsec: fallback (use the next-coarser tier and "
+        "report it) or fail (stop, naming the missing cells). "
+        "Default: fallback.",
+    )
+    parser.add_argument(
+        "--max-zoom",
+        dest="max_zoom",
+        type=int,
+        default=None,
+        help="maximum zoom level for the --maplibre bundle. The hillshade "
+        "layer is additionally capped by what the source DEM resolution "
+        "can actually support (z12 for 3 arcsec, z14 for 1 arcsec); the "
+        "provenance report states which of the two bound the result.",
     )
     parser.add_argument(
         "-l",
@@ -115,18 +149,35 @@ def main():
         elif args.waypoint_file:
             generator.add_waypoint_file(args.waypoint_file)
 
+        dem_arcsec = None if args.dem_arcsec == "auto" else float(args.dem_arcsec)
+
         generator.add_information_file(args.output_file)
         generator.add_topology(
             compressed=args.compressed, level_of_detail=args.level_of_detail
         )
-        generator.add_terrain(args.resolution)
+        generator.add_terrain(
+            args.resolution,
+            dem_arcsec=dem_arcsec,
+            dem_missing_policy=args.dem_missing_policy,
+        )
         if args.maplibre:
             # Optional, additive: only ever paints a visual base map layer.
             # Terrain/topology/waypoints/airspace above are untouched.
             dir_static = args.maplibre_static or os.path.join(
                 app_dir, "data", "maplibre-static"
             )
-            generator.add_maplibre(dir_static=dir_static, name=args.output_file)
+            maplibre_args = {}
+            if args.max_zoom is not None:
+                maplibre_args["max_zoom"] = args.max_zoom
+                maplibre_args["max_zoom_source"] = "CLI --max-zoom"
+            generator.add_maplibre(
+                dir_static=dir_static,
+                name=args.output_file,
+                dem_arcsec=dem_arcsec,
+                dem_missing_policy=args.dem_missing_policy,
+                **maplibre_args
+            )
+        generator.add_provenance_file()
         generator.create(args.output_file)
         generator.cleanup()
     finally:

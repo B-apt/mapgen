@@ -177,16 +177,92 @@ docker compose run --rm --no-deps -v /tmp/maki_icons:/workspace/maki_icons:ro \
 see `xcsoar-maplibre-poc/docs/DATA_SOURCES.md`. The download links are
 Google Drive folders and can't be scripted; unzip the `.hgt` tiles into
 `~/.xcsoar_mapgen/mapgen-data/dem/`. This is genuinely optional: without
-it, the hillshade layer automatically falls back to plain SRTM
-(`data/dem3/`), which mapgen already auto-downloads per-tile as needed -
-you lose some elevation accuracy over steep terrain, not functionality. If
-a requested map's bounds have no elevation data available at all, the
-MapLibre bundle is silently skipped (the rest of the map still builds
-normally); if bounds are only partially covered, the hillshade layer is
-clipped to whatever coverage exists.
+it, everything still builds from plain SRTM (`data/dem3/`), which mapgen
+auto-downloads per-tile as needed - you lose some elevation accuracy over
+steep terrain, not functionality.
+
+Note that this data is **not** used unless a job asks for it: choose
+"Maximum" on the web form, or pass `--dem-arcsec 1`. See "Elevation data
+resolution" below for why it is opt-in.
 
 Once steps 1-3 are done, `docker compose up -d` and the checkbox on the
 web form (or `bin/mapgen --maplibre`) works. See
 `xcsoar-maplibre-poc/README.md` for the design rationale and
 `xcsoar-maplibre-poc/docs/GENERATE_TEST_BUNDLE.md` for a full walkthrough
 with a validation script.
+
+### Elevation data resolution
+
+Two independent things used to be conflated under one "resolution"
+setting. They are now separate, because they are separate:
+
+| | what it controls | values |
+|---|---|---|
+| **source tier** (`--dem-arcsec`) | which elevation dataset is *read* | `1`, `3`, `auto` |
+| **output spacing** (`-r`) | the grid `terrain.jp2` is *written* on | `9`, `3` |
+
+The old "High resolution terrain (3 arcseconds per pixel instead of 9)"
+checkbox was only ever the second one - it resampled the same 3-arcsec
+source onto a finer output grid. It never fetched better data.
+
+The web form offers the sensible combinations:
+
+| form option | source tier | `terrain.jp2` |
+|---|---|---|
+| Standard (default) | 3 arcsec | 9 arcsec |
+| High | 3 arcsec | 3 arcsec |
+| Maximum | 1 arcsec | 3 arcsec |
+
+**The two tiers are not equally available.** `data/dem3/` (3 arcsec) is
+global and auto-downloaded. `data/dem/` (1 arcsec) is curated by hand,
+covers only part of Europe, and *cannot* be downloaded - so a 1-arcsec
+request will routinely hit cells that have no such data. That is what the
+missing-data policy decides:
+
+* `fallback` (default) - fill those cells from the 3-arcsec tier, mark
+  them downgraded, carry on.
+* `fail` - stop, naming exactly which 1-degree cells fell short.
+
+The default is 3 arcsec rather than "best available" so that the same
+request produces the same data on any worker, regardless of which
+1-arcsec tiles happen to be cached there.
+
+Resolution also sets how deep the MapLibre hillshade is tiled: **z12 for
+3-arcsec source data, z14 for 1-arcsec**. Baking deeper than the source
+supports adds visible terracing, not detail. The server-side
+`maplibre_max_zoom` in `lib/xcsoar/mapgen/server/config.py` is a separate
+ceiling on top of that.
+
+### Knowing what a map was actually built from
+
+Every generated `.xcm` now contains a `dem_provenance.txt` (and
+`maplibre/PROVENANCE.txt` for the bundle) recording what was really read,
+not what was requested:
+
+```
+=== DEM provenance (MapLibre hillshade) ===
+requested: 1 arcsec     policy: fallback
+used:      1 arcsec  x1   (data/dem, manual)
+used:      3 arcsec  x1   (data/dem3, DOWNGRADED: N43E008)
+missing:   none
+hillshade: z0-12   (capped by: source resolution (3"), server config maplibre_max_zoom=14 allowed more)
+smoothing: 2x 3x3 box on the Mercator-resampled grid
+coverage:  5.372,44.461 -> 7.292,46.381  (= requested, not clipped)
+```
+
+The `hillshade:` line names *which* constraint set the zoom. Without it,
+a bundle capping at z12 is ambiguous between "the DEM is coarse" and "a
+config value said so" - an ambiguity that has already caused one
+misdiagnosis, and which cost two zoom levels of real detail on
+1-arcsec-sourced bundles until it was found.
+
+Run the test suite with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The acceptance tests check the report's per-cell claims against the
+elevation values themselves (a cell claimed as 1 arcsec must carry detail
+the 3-arcsec tier cannot represent), so a report that agrees with buggy
+code still fails. They skip automatically if the data cache is absent.

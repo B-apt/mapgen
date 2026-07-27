@@ -24,6 +24,8 @@ def generate_map(
     level_of_detail=3,
     maplibre=False,
     dir_static=None,
+    dem_arcsec=3.0,
+    dem_missing_policy="fallback",
 ):
     output_file = name + ".xcm"
     if os.path.exists(output_file):
@@ -40,32 +42,47 @@ def generate_map(
     generator.add_information_file(output_file, author="the XCSoar team")
     generator.add_welt2000()
     generator.add_topology(level_of_detail=level_of_detail)
-    generator.add_terrain(resolution)
+    generator.add_terrain(
+        resolution,
+        dem_arcsec=dem_arcsec,
+        dem_missing_policy=dem_missing_policy,
+    )
     if maplibre:
         # Optional, additive: only ever paints a visual base map layer.
         # Terrain/topology/waypoints/airspace above are untouched.
         generator.add_maplibre(
             dir_static=dir_static or os.path.join(dir_data, "maplibre-static"),
             name=name,
+            dem_arcsec=dem_arcsec,
+            dem_missing_policy=dem_missing_policy,
         )
+    generator.add_provenance_file()
     generator.create(output_file)
     generator.cleanup()
 
 
-def generate_maps(name, bounds, dir_data, dir_temp, maplibre=False, dir_static=None):
-    generate_map(
-        name, bounds, dir_data, dir_temp, 9.0, 3, maplibre=maplibre, dir_static=dir_static
-    )
-    generate_map(
-        name + "_HighRes",
-        bounds,
-        dir_data,
-        dir_temp,
-        3.0,
-        3,
+def generate_maps(
+    name,
+    bounds,
+    dir_data,
+    dir_temp,
+    maplibre=False,
+    dir_static=None,
+    dem_arcsec=3.0,
+    dem_missing_policy="fallback",
+):
+    common = dict(
         maplibre=maplibre,
         dir_static=dir_static,
+        dem_arcsec=dem_arcsec,
+        dem_missing_policy=dem_missing_policy,
     )
+    # The two variants differ only in terrain.jp2's OUTPUT spacing; both
+    # read the same source DEM tier. That distinction is the whole point of
+    # dem_arcsec being separate - "_HighRes" never meant better source
+    # data, only a finer output grid, and now says so.
+    generate_map(name, bounds, dir_data, dir_temp, 9.0, 3, **common)
+    generate_map(name + "_HighRes", bounds, dir_data, dir_temp, 3.0, 3, **common)
 
 
 def main():
@@ -89,6 +106,28 @@ def main():
         help="directory of job-independent MapLibre assets (style "
         "template, sprites, glyphs). Defaults to <dir_data>/maplibre-static.",
     )
+    parser.add_argument(
+        "--dem-arcsec",
+        dest="dem_arcsec",
+        choices=["auto", "1", "3"],
+        default="3",
+        help="SOURCE elevation data tier to read: 1 arcsec (data/dem, "
+        "curated by hand, partial coverage), 3 arcsec (data/dem3, global), "
+        "or auto for the best available per 1-degree cell. Default: 3. "
+        "Independent of each map's output grid spacing.",
+    )
+    parser.add_argument(
+        "--dem-missing-policy",
+        dest="dem_missing_policy",
+        choices=["fallback", "fail"],
+        default="fallback",
+        help="what to do when a 1-degree cell has no data at the tier "
+        "given by --dem-arcsec: fallback (use the next-coarser tier and "
+        "report it) or fail (stop, naming the missing cells). Note a batch "
+        "run covers many regions, most with no 1 arcsec data at all, so "
+        "'fail' with --dem-arcsec=1 will stop almost immediately. "
+        "Default: fallback.",
+    )
     args = parser.parse_args()
 
     dir_data = os.path.join(app_dir, "data")
@@ -105,6 +144,10 @@ def main():
                 dir_temp,
                 maplibre=args.maplibre,
                 dir_static=args.maplibre_static,
+                dem_arcsec=(
+                    None if args.dem_arcsec == "auto" else float(args.dem_arcsec)
+                ),
+                dem_missing_policy=args.dem_missing_policy,
             )
     finally:
         if os.path.exists(dir_temp):

@@ -34,6 +34,16 @@ class Downloader:
                 line = line.split(None, 1)
                 self.__checksums[line[1]] = line[0]
 
+    @property
+    def dir(self):
+        """
+        Root of the local data cache mirror. Exposed so DemCache can look
+        for tiles on disk under the same root this Downloader would fetch
+        them into, instead of being handed a second, independently derived
+        path that could drift out of sync with it.
+        """
+        return self.__dir
+
     def manifest(self):
         if not self.__manifest:
             self.__manifest = json.loads(slurp(self.retrieve("manifest")))
