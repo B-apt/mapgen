@@ -10,6 +10,7 @@ sys.path.append(os.path.join(app_dir, "lib"))
 
 from xcsoar.mapgen.generator import Generator
 from xcsoar.mapgen.georect import GeoRect
+from xcsoar.mapgen.osm_extracts import OsmExtractCache
 from xcsoar.mapgen.waypoints.parser import parse_waypoint_file
 
 
@@ -100,8 +101,8 @@ def main():
         help="also build an offline MapLibre visual-basemap bundle (vector "
         "tiles + hillshade + style.json) into the .xcm file. Off by "
         "default - existing output is unaffected. Requires osmium-tool, "
-        "planetiler and gdal on this machine, and a pre-fetched regional "
-        "OSM extract in the data cache - see docs/DATA_SOURCES.md.",
+        "planetiler and gdal on this machine; the regional OSM extract is "
+        "downloaded on first use - see docs/DATA_SOURCES.md.",
     )
     parser.add_argument(
         "--maplibre-static",
@@ -110,6 +111,18 @@ def main():
         default=None,
         help="directory of job-independent MapLibre assets (style "
         "template, sprites, glyphs). Defaults to <data>/maplibre-static.",
+    )
+    parser.add_argument(
+        "--no-maplibre-download",
+        dest="maplibre_download",
+        action="store_false",
+        default=True,
+        help="never fetch source data for the --maplibre bundle. The "
+        "Geofabrik region(s) covering the requested bounds must then "
+        "already be in <data>/osm/geofabrik/ (see bin/mapgen-osm-cache), "
+        "and Planetiler's auxiliary sources in "
+        "<data>/planetiler-sources/; otherwise the bundle is skipped and "
+        "the reason is recorded in the provenance report.",
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
@@ -175,6 +188,11 @@ def main():
                 name=args.output_file,
                 dem_arcsec=dem_arcsec,
                 dem_missing_policy=args.dem_missing_policy,
+                osm_cache=OsmExtractCache(
+                    os.path.join(app_dir, "data"),
+                    allow_download=args.maplibre_download,
+                ),
+                allow_download=args.maplibre_download,
                 **maplibre_args
             )
         generator.add_provenance_file()

@@ -1,0 +1,61 @@
+#!/bin/sh
+# Wrapper around `java -jar planetiler.jar`, installed as
+# /usr/local/bin/planetiler by container/worker/Dockerfile.
+#
+# Reads the environment, so the image stays deployment-neutral and the proxy is
+# configured per-deployment (see the `environment:` block for
+# mapgen-worker in docker-compose.yml, which forwards them from the host
+# or from a local, git-ignored .env file).
+
+set -eu
+
+JAVA_PROXY_OPTS=""
+
+# scheme_opts <proxy-url> <http|https>
+# Accepts the usual shapes: "http://host:3128/", "http://user:pw@host:3128",
+# "host:3128", "http://host".
+scheme_opts() {
+    url="$1"
+    scheme="$2"
+    [ -n "$url" ] || return 0
+
+    hostport="${url#*://}"      # strip scheme:// (no-op when absent)
+    hostport="${hostport%%/*}"  # strip /path and any trailing slash
+    hostport="${hostport##*@}"  # strip user:password@
+
+    case "$hostport" in
+        *:*)
+            host="${hostport%:*}"
+            port="${hostport##*:}"
+            ;;
+        *)
+            host="$hostport"
+            port=80
+            ;;
+    esac
+
+    [ -n "$host" ] || return 0
+    JAVA_PROXY_OPTS="${JAVA_PROXY_OPTS} -D${scheme}.proxyHost=${host} -D${scheme}.proxyPort=${port}"
+}
+
+# Lower-case wins if both are set, matching curl/wget convention.
+scheme_opts "${http_proxy:-${HTTP_PROXY:-}}" http
+scheme_opts "${https_proxy:-${HTTPS_PROXY:-}}" https
+
+# no_proxy is a comma-separated list with bare-dot suffixes
+# (".example.com"); Java wants pipe-separated glob patterns
+# ("*.example.com").
+no_proxy_value="${no_proxy:-${NO_PROXY:-}}"
+if [ -n "$no_proxy_value" ]; then
+    non_proxy_hosts=$(
+        printf '%s' "$no_proxy_value" \
+            | tr -d ' ' \
+            | sed -e 's/,/|/g' -e 's/^\./*./' -e 's/|\./|*./g'
+    )
+    # Java only consults http.nonProxyHosts, but set both so the intent
+    # survives a future JDK that starts honouring the https one.
+    JAVA_PROXY_OPTS="${JAVA_PROXY_OPTS} -Dhttp.nonProxyHosts=${non_proxy_hosts} -Dhttps.nonProxyHosts=${non_proxy_hosts}"
+fi
+
+# shellcheck disable=SC2086  # JAVA_PROXY_OPTS must word-split into args
+exec /opt/java21/bin/java -Xmx4g ${JAVA_PROXY_OPTS} -jar /usr/local/bin/planetiler.jar "$@"

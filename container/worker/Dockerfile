@@ -18,11 +18,10 @@ RUN curl -L -o /tmp/jre21.tar.gz \
     && tar -xzf /tmp/jre21.tar.gz -C /opt/java21 --strip-components=1 \
     && rm /tmp/jre21.tar.gz
 RUN curl -L -o /usr/local/bin/planetiler.jar \
-        https://github.com/onthegomap/planetiler/releases/download/v0.10.2/planetiler.jar \
-    && cat <<'EOF' > /usr/local/bin/planetiler
-#!/bin/sh
-exec /opt/java21/bin/java -Xmx4g -jar /usr/local/bin/planetiler.jar "$@"
-EOF
+        https://github.com/onthegomap/planetiler/releases/download/v0.10.2/planetiler.jar
+
+# Wrapper script to run planetiler behind proxy (if proxy env variables presents)
+COPY container/worker/planetiler /usr/local/bin/planetiler
 RUN chmod +x /usr/local/bin/planetiler
 
 # spreet: builds the MapLibre sprite sheet (sprite.png + sprite.json) from

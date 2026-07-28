@@ -7,6 +7,7 @@ import traceback
 import shutil
 from xcsoar.mapgen.server.job import Job
 from xcsoar.mapgen.generator import Generator
+from xcsoar.mapgen.osm_extracts import OsmExtractCache
 from xcsoar.mapgen.util import check_commands
 from xcsoar.mapgen.server.config import mapgen
 
@@ -103,6 +104,18 @@ This link is valid for 7 days.
                 job.update_status("Creating MapLibre bundle...")
                 generator.add_maplibre(
                     dir_static=os.path.join(self.__dir_data, "maplibre-static"),
+                    # Built here rather than inside the bundle so the
+                    # deployment's download limits come from the server
+                    # config, while bin/mapgen keeps library defaults.
+                    osm_cache=OsmExtractCache(
+                        self.__dir_data,
+                        allow_download=mapgen["maplibre_allow_downloads"],
+                        max_download_bytes=mapgen[
+                            "maplibre_osm_max_download_bytes"
+                        ],
+                        max_age_days=mapgen["maplibre_osm_max_age_days"],
+                    ),
+                    allow_download=mapgen["maplibre_allow_downloads"],
                     name=description.name,
                     max_zoom=mapgen["maplibre_max_zoom"],
                     # Named so the provenance report can attribute the

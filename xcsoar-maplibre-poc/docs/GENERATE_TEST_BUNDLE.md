@@ -36,10 +36,9 @@ inside the container - this is the same cache `add_terrain()`'s SRTM
 downloader already uses, just with a few new subdirectories:
 
 ```
-data/osm/<name>.osm.pbf         Geofabrik regional extract (any single
-                                 *.osm.pbf directly under data/osm/ is
-                                 auto-detected; name it region.osm.pbf if
-                                 you keep more than one around)
+data/osm/geofabrik/...          Geofabrik regional extracts, downloaded
+                                 automatically by the first job whose
+                                 bounds need them - see below
 data/dem/<NAME>.hgt             Sonny's LiDAR DTM, uppercase names
                                  (N45E006.hgt) - preferred hillshade source
 data/dem3/<name>.hgt            existing SRTM cache (lowercase), used both
@@ -52,36 +51,28 @@ data/planetiler-sources/        3 small *global* files the default
                                  Natural Earth) - one-time fetch, see below
 ```
 
-`data/osm` and `data/dem`/`data/dem3` are operator-maintained exactly like
-before - see `docs/DATA_SOURCES.md` for where to get them (Geofabrik,
-sonny.4lima.de). Sonny's download links are Google Drive folders, not
-`wget`-able, so that one is a manual step.
+`data/osm/geofabrik/` needs no setup: the Geofabrik region(s) covering a
+job's bounding box are worked out from those bounds and downloaded on
+first use, then reused by every later job over the same area. Use
+`bin/mapgen-osm-cache select -b <left> <right> <top> <bottom>` to see what
+a given box would pull before running it, and `prefetch` to warm the
+cache off the critical path. See the main README for the download-limit
+settings.
 
-`data/planetiler-sources/` is new and is fetched once with planetiler
-itself (`--download`, requires network - point Java at your proxy if
-needed):
+`data/dem`/`data/dem3` are still operator-maintained - see
+`docs/DATA_SOURCES.md` for where to get them (sonny.4lima.de). Sonny's
+download links are Google Drive folders, not `wget`-able, so that one
+stays a manual step.
 
-```bash
-docker compose run --rm --no-deps --entrypoint bash mapgen-worker -c '
-  mkdir -p /opt/mapgen/data/planetiler-sources
-  /opt/java21/bin/java -Xmx4g \
-    -Dhttp.proxyHost=<proxy-host> -Dhttp.proxyPort=<proxy-port> \
-    -Dhttps.proxyHost=<proxy-host> -Dhttps.proxyPort=<proxy-port> \
-    -jar /usr/local/bin/planetiler.jar \
-    --osm-path=/opt/mapgen/data/osm/<your-extract>.osm.pbf \
-    --output=/tmp/throwaway.mbtiles --force --download \
-    --lake_centerlines_path=/opt/mapgen/data/planetiler-sources/lake_centerline.shp.zip \
-    --water_polygons_path=/opt/mapgen/data/planetiler-sources/water-polygons-split-3857.zip \
-    --natural_earth_path=/opt/mapgen/data/planetiler-sources/natural_earth_vector.sqlite.zip
-'
-```
+`data/planetiler-sources/` needs no setup either: the first job that
+finds those three files missing fetches them with planetiler itself
+(~1.4 GB, one-time), and only whichever are actually absent.
 
-(omit the `-Dhttp*.proxy*` flags if you don't need one - Java does **not**
-read the `http_proxy`/`https_proxy` env vars the way `curl`/`wget` do, so
-without them this specific one-time step silently times out even though
-the container has working network access otherwise.) After this, every
-normal job run passes `--download=false` (planetiler's default) and never
-touches the network - same caching philosophy as the OSM/DEM tiles.
+If this worker is behind an HTTP proxy, put `http_proxy`/`https_proxy` in
+a `.env` file next to `docker-compose.yml` (git-ignored). Java does
+**not** read those variables itself - `container/worker/planetiler`
+translates them into the `-D` properties the JVM honours, for both the
+build and the running container. See the main README.
 
 ## 2. Build the one-time static assets (once, into `data/maplibre-static/`)
 

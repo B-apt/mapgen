@@ -278,6 +278,8 @@ author: {author}
         max_zoom_source="default",
         dem_arcsec=DEFAULT_ARCSEC,
         dem_missing_policy=DEFAULT_POLICY,
+        osm_cache=None,
+        allow_download=True,
     ):
         """
         Adds an optional, additive offline MapLibre visual-basemap bundle
@@ -292,12 +294,19 @@ author: {author}
         @param dir_static: directory of job-independent MapLibre assets
                             (style.json.tmpl, sprites/, glyphs/) - see
                             docs/GENERATE_TEST_BUNDLE.md.
+        @param osm_cache:  an OsmExtractCache carrying this deployment's
+                            download limits, or None for the defaults.
+        @param allow_download: whether missing MapLibre source data may be
+                            fetched. Applies to Planetiler's auxiliary
+                            sources; osm_cache carries the same switch for
+                            the OSM extracts.
         """
         print("Adding MapLibre bundle...")
         if not self.__bounds:
             raise RuntimeError("Boundaries undefined.")
 
         from xcsoar.mapgen.maplibre import MapLibreBundle, NoDemCoverageError
+        from xcsoar.mapgen.osm_extracts import OsmExtractError
 
         bundle = MapLibreBundle(
             dir_data=self.__dir_data,
@@ -306,6 +315,8 @@ author: {author}
             dem_cache=self.__dem_cache,
             dem_arcsec=dem_arcsec,
             dem_missing_policy=dem_missing_policy,
+            osm_cache=osm_cache,
+            allow_download=allow_download,
         )
         try:
             bundle_dir = bundle.build(
@@ -334,9 +345,25 @@ author: {author}
                 ]
             )
             return
+        except OsmExtractError as e:
+            # The vector layer's data could not be obtained: no Geofabrik
+            # region covers these bounds, the ones that do exceed the
+            # download limit, or downloads are switched off on this
+            # worker. Same treatment as a DEM shortfall, for the same
+            # reason - terrain, topology, waypoints and airspace are all
+            # already built by this point and are unaffected, so taking
+            # the job down would throw away real work over a decorative
+            # layer. The reason is recorded rather than only logged.
+            print("Skipping MapLibre bundle: {}".format(e))
+            self.__provenance_sections.append(
+                [
+                    "=== OSM provenance (MapLibre vector basemap) ===",
+                    "skipped: {}".format(e),
+                ]
+            )
+            return
 
-        if bundle.provenance():
-            self.__provenance_sections.append(bundle.provenance().lines())
+        self.__provenance_sections.extend(bundle.provenance_sections())
 
         for root, _dirs, files in os.walk(bundle_dir):
             for filename in files:

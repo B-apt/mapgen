@@ -12,6 +12,11 @@
 data
 jobs
 *.pyc
+
+# Local docker compose settings - proxy hostnames and the like
+.env
+docker-compose.override.yml
+
 bin/shptree
 bin/gdalwarp
 bin/ogr2ogr
@@ -21,3 +26,5 @@ xcsoar-maplibre-poc/hypsometric-restyle/images
 xcsoar-maplibre-poc/hypsometric-restyle/scripts
 
 prompts
+
+viewfinderpanoramasorg

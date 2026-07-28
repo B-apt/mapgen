@@ -15,7 +15,20 @@ services:
     build:
       context: .
       dockerfile: ./container/worker/Dockerfile
+      # Docker's predefined proxy build args: empty here by default
+      # no-op for a normal deployment, Set the values in a local .env file.
+      args:
+        http_proxy: ${http_proxy:-}
+        https_proxy: ${https_proxy:-}
+        no_proxy: ${no_proxy:-}
     image: ghcr.io/xcsoar/mapgen-worker
+    # Empty by default, so this is a no-op
+    # on a normal deployment: set the values in a local .env file or export 
+    # them before `docker compose up`
+    environment:
+      - http_proxy=${http_proxy:-}
+      - https_proxy=${https_proxy:-}
+      - no_proxy=${no_proxy:-}
     volumes:
       - mapgen-jobs:/opt/mapgen/jobs
       - mapgen-data:/opt/mapgen/data

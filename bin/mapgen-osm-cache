@@ -1,0 +1,155 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+# Operator tool for the OSM extract cache the MapLibre vector basemap is
+# built from (lib/xcsoar/mapgen/osm_extracts.py).
+#
+# Nothing here is required to generate a map: a --maplibre job downloads
+# whatever it needs on its own. This exists for the three cases where
+# doing it out of band is better than doing it mid-job:
+#
+#   select    see which Geofabrik region(s) a bbox would pull, and how
+#             big they are, WITHOUT downloading anything - the answer to
+#             "why did this job want 4 GB?"
+#   prefetch  warm the cache off the critical path, e.g. before a
+#             competition, rather than making the first job wait for a
+#             500 MB download
+#   list      what is cached, how big, how old
+
+import argparse
+import os
+import sys
+
+app_dir = os.path.abspath(__file__ + "/../..")
+sys.path.append(os.path.join(app_dir, "lib"))
+
+from xcsoar.mapgen.georect import GeoRect
+from xcsoar.mapgen.osm_extracts import (
+    OsmExtractCache,
+    OsmExtractError,
+    human_bytes,
+)
+
+
+def cmd_list(cache, args):
+    entries = cache.cached_regions()
+    if not entries:
+        print("No OSM extracts cached in {}".format(cache.dir_cache))
+        return 0
+    print("{:<44} {:>10}  {}".format("REGION", "SIZE", "DOWNLOADED"))
+    for path, meta in entries:
+        import datetime
+
+        stamp = meta.get("downloaded_at")
+        when = (
+            datetime.datetime.fromtimestamp(stamp).strftime("%Y-%m-%d")
+            if stamp
+            else datetime.datetime.fromtimestamp(
+                os.path.getmtime(path)
+            ).strftime("%Y-%m-%d") + " (mtime)"
+        )
+        print(
+            "{:<44} {:>10}  {}".format(
+                meta.get("region_id", "?"),
+                human_bytes(os.path.getsize(path)),
+                when,
+            )
+        )
+    return 0
+
+
+def cmd_select(cache, args):
+    bounds = GeoRect(*args.bbox) if args.bbox else None
+    regions = cache.select(bounds)
+    total = 0
+    pending = 0
+    for region in regions:
+        size = cache.index.size_of(region)
+        cached = cache.is_cached(region)
+        total += size
+        if not cached:
+            pending += size
+        print(
+            "{:<44} {:>10}  {}".format(
+                region.id,
+                human_bytes(size),
+                "cached" if cached else "WOULD DOWNLOAD",
+            )
+        )
+    print()
+    print("{} region(s), {} total, {} to download".format(
+        len(regions), human_bytes(total), human_bytes(pending)))
+    return 0
+
+
+def cmd_prefetch(cache, args):
+    if args.bbox:
+        regions = cache.select(GeoRect(*args.bbox))
+    else:
+        regions = []
+        for region_id in args.regions:
+            region = cache.index.region(region_id)
+            if not region:
+                print("No such Geofabrik region: {}".format(region_id))
+                return 1
+            regions.append(region)
+    cache.ensure(regions)
+    print("Cached: {}".format(", ".join(r.id for r in regions)))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Inspect and populate the OSM extract cache used by "
+        "the MapLibre visual basemap."
+    )
+    parser.add_argument(
+        "--data",
+        default=os.path.join(app_dir, "data"),
+        help="mapgen data cache root (default: %(default)s)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("list", help="show cached extracts")
+    p.set_defaults(func=cmd_list)
+
+    bbox_args = dict(
+        metavar=("left", "right", "top", "bottom"),
+        type=float,
+        nargs=4,
+        help="map boundaries, in the same order bin/mapgen -b takes them",
+    )
+
+    p = sub.add_parser(
+        "select", help="show which regions a bbox needs, without downloading"
+    )
+    p.add_argument("-b", dest="bbox", required=True, **bbox_args)
+    p.set_defaults(func=cmd_select)
+
+    p = sub.add_parser("prefetch", help="download regions ahead of a job")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("-b", dest="bbox", **bbox_args)
+    group.add_argument(
+        "regions", nargs="*", default=[],
+        help="Geofabrik region ids, e.g. europe/france/rhone-alpes",
+    )
+    p.set_defaults(func=cmd_prefetch)
+
+    args = parser.parse_args()
+
+    # `list` must work on a worker that cannot reach Geofabrik, so only
+    # the commands that genuinely need the index say so.
+    cache = OsmExtractCache(
+        args.data,
+        allow_download=args.command in ("prefetch", "select"),
+        max_download_bytes=0,  # an operator asking for it means it
+    )
+    try:
+        return args.func(cache, args)
+    except OsmExtractError as e:
+        print("Error: {}".format(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

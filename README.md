@@ -113,42 +113,82 @@ built, and is off by default.
 
 `container/worker/Dockerfile` already installs everything the *build
 process* needs (osmium-tool, GDAL, a bundled Java 21 runtime + planetiler,
-spreet) - `docker compose build` picks that up automatically. What it
-can't do for you is fetch the underlying map *data*, which is too large to
-ship in the image. Do this once, after the volumes above are set up:
+spreet) - `docker compose build` picks that up automatically. The
+underlying map *data* is too large to ship in the image, so it is
+fetched into the data volume instead: step 1 below happens by itself,
+steps 2-4 are still one-time manual setup.
 
-**1. A regional OSM extract**, for the vector basemap layer (roads, water,
-land use, place labels) - pick whichever [Geofabrik](https://download.geofabrik.de/)
-region(s) cover the areas you'll actually generate maps for:
+**1. A regional OSM extract** - *automatic.* The
+vector basemap layer (roads, water, land use, place labels) is cut from
+[Geofabrik](https://download.geofabrik.de/) regional extracts, and the
+first job that needs one works out which region(s) cover its bounding box
+and downloads them into `data/osm/geofabrik/`. Later jobs over the same
+area reuse the cache.
+
+Region choice is derived from the job's own bounds, so a map that
+straddles a border pulls each side and merges them - a French/Swiss Alps
+box gets `rhone-alpes` + `switzerland` rather than the 2.2 GB `alps`
+extract that also covers it, or the 33 GB `europe` one. Three settings in
+`lib/xcsoar/mapgen/server/config.py` bound this:
+
+| | |
+|---|---|
+| `maplibre_osm_max_download_bytes` | ceiling on *new* data per job (default 3 GB). Cached regions don't count. |
+| `maplibre_allow_downloads` | set `False` for an air-gapped worker (covers the Planetiler sources in step 2 too) |
+| `maplibre_osm_max_age_days` | re-download cached extracts after N days (default `0` = never) |
+
+A job needing more than the limit - a bbox over half a continent, or one
+that is mostly open sea - **skips the MapLibre bundle and records why in
+the provenance report**; terrain, topology, waypoints and airspace still
+build normally.
+
+`bin/mapgen-osm-cache` inspects and pre-populates the cache:
 
 ```bash
-mkdir -p ~/.xcsoar_mapgen/mapgen-data/osm
-curl -L -o ~/.xcsoar_mapgen/mapgen-data/osm/region.osm.pbf \
-  https://download.geofabrik.de/europe/france/rhone-alpes-latest.osm.pbf
+# what would this bbox pull? (no download; same -b order as bin/mapgen)
+bin/mapgen-osm-cache select -b 5.28 6.99 46.13 43.78
+# fetch ahead of time, off the critical path
+bin/mapgen-osm-cache prefetch europe/france/rhone-alpes
+bin/mapgen-osm-cache list
 ```
 
-(`region.osm.pbf` is checked first; any single `*.osm.pbf` directly under
-`data/osm/` is also auto-detected if you'd rather name it after the region)
+For an air-gapped worker, put the extract at the path `select` reports
+under `data/osm/geofabrik/` and it is used as-is.
 
-**2. Planetiler's global auxiliary sources** (water polygons, lake
-centerlines, Natural Earth - required by its OpenMapTiles profile
-regardless of which area you build, ~1.4GB, one-time):
+**2. Planetiler's global auxiliary sources** - *automatic* 
+Its OpenMapTiles profile needs three global datasets
+(water polygons, lake centerlines, Natural Earth) to render coastlines
+and lakes at low zoom, regardless of which area you build. The first job
+that finds them missing fetches them into `data/planetiler-sources/`
+(~1.4 GB, one-time); every later job reuses them, and only whichever
+files are actually absent get downloaded.
+
+Planetiler does the fetching itself, so the file versions stay matched to
+the bundled jar - those URLs are pinned inside it and change between
+releases. `maplibre_allow_downloads: False` turns this off along with the
+OSM extracts, for an air-gapped worker.
+
+### HTTP proxy
+
+In case you are executing behind an HTTP proxy: 
+**Java does not read `http_proxy`/`https_proxy`**, so a wrapper script:
+`container/worker/planetiler` now translates whatever proxy variables are
+in the environment into the `-D` system properties Java actually honours.
+
+Put the values in a **`.env` file next to `docker-compose.yml`** - it is
+git-ignored, and `docker compose` reads it automatically for both the
+build and the running container:
 
 ```bash
-mkdir -p ~/.xcsoar_mapgen/mapgen-data/planetiler-sources
-docker compose run --rm --no-deps --entrypoint bash mapgen-worker -c '
-  /opt/java21/bin/java -Xmx4g -jar /usr/local/bin/planetiler.jar \
-    --osm-path=/opt/mapgen/data/osm/region.osm.pbf \
-    --output=/tmp/throwaway.mbtiles --force --download \
-    --lake_centerlines_path=/opt/mapgen/data/planetiler-sources/lake_centerline.shp.zip \
-    --water_polygons_path=/opt/mapgen/data/planetiler-sources/water-polygons-split-3857.zip \
-    --natural_earth_path=/opt/mapgen/data/planetiler-sources/natural_earth_vector.sqlite.zip
-'
+cat > .env <<'EOF'
+http_proxy=http://proxy.example.com:8080/
+https_proxy=http://proxy.example.com:8080/
+no_proxy=localhost,127.0.0.1
+EOF
 ```
 
-(add `-Dhttp.proxyHost=<host> -Dhttp.proxyPort=<port>` and the `https`
-equivalent right after `-Xmx4g` if you're behind a proxy - Java does not
-read the `http_proxy`/`https_proxy` env vars the way curl/wget do)
+Note: Without a `.env` these resolve to empty strings and everything behaves 
+normally.
 
 **3. Static style assets** (sprite sheet + font glyphs, identical for every
 job, built once):
@@ -233,6 +273,8 @@ supports adds visible terracing, not detail. The server-side
 `maplibre_max_zoom` in `lib/xcsoar/mapgen/server/config.py` is a separate
 ceiling on top of that.
 
+## How To
+
 ### Knowing what a map was actually built from
 
 Every generated `.xcm` now contains a `dem_provenance.txt` (and
@@ -256,13 +298,11 @@ config value said so" - an ambiguity that has already caused one
 misdiagnosis, and which cost two zoom levels of real detail on
 1-arcsec-sourced bundles until it was found.
 
-Run the test suite with:
+
+### Test suite
+
+Tests are in the folder `tests`. Run the test suite with:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-
-The acceptance tests check the report's per-cell claims against the
-elevation values themselves (a cell claimed as 1 arcsec must carry detail
-the 3-arcsec tier cannot represent), so a report that agrees with buggy
-code still fails. They skip automatically if the data cache is absent.

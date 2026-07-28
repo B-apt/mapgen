@@ -36,11 +36,12 @@
 #     sqlite3            packing raster tiles into a single .mbtiles file
 #     numpy, rasterio     Terrain-RGB packing
 #
-# See docs/DATA_SOURCES.md for where to source the underlying OSM extract
-# and elevation tiles, and docs/GENERATE_TEST_BUNDLE.md for an end-to-end
+# The OSM extract is no longer an operator prerequisite - osm_extracts.py
+# derives the Geofabrik region(s) from the job's own bounds and fetches
+# them on first use. See docs/DATA_SOURCES.md for the elevation tiles,
+# which still are, and docs/GENERATE_TEST_BUNDLE.md for an end-to-end
 # walkthrough.
 
-import glob
 import gzip
 import json
 import math
@@ -48,8 +49,10 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 
 from xcsoar.mapgen.georect import GeoRect
+from xcsoar.mapgen.osm_extracts import OsmExtractCache
 from xcsoar.mapgen.terrain.dem_cache import (
     AUTO_ARCSEC,
     DEFAULT_ARCSEC,
@@ -59,7 +62,7 @@ from xcsoar.mapgen.terrain.dem_cache import (
     DemCoverageError,
     cell_name,
 )
-from xcsoar.mapgen.util import slurp, spew
+from xcsoar.mapgen.util import FileLock, slurp, spew
 
 
 class NoDemCoverageError(DemCoverageError):
@@ -79,7 +82,6 @@ class NoDemCoverageError(DemCoverageError):
     """
 
 
-_CMD_OSMIUM = "osmium"
 _CMD_PLANETILER = "planetiler"  # wrapper script around `java -jar planetiler.jar`
 _CMD_GDALBUILDVRT = "gdalbuildvrt"
 _CMD_GDALWARP = "gdalwarp"
@@ -124,14 +126,24 @@ _PACK_BLOCK_BYTES = 256 * 1024 * 1024
 
 # Global, job-independent source files the default Planetiler OpenMapTiles
 # profile needs in addition to the regional OSM extract (low-zoom water/
-# lake rendering). Same "operator pre-fetches once, jobs never touch the
-# network" cache model as data/osm and data/dem - see
+# lake rendering). Same "fetch once, every later job reuses the cache"
+# model as data/osm/geofabrik and data/dem3 - see
 # docs/GENERATE_TEST_BUNDLE.md for the one-time fetch command.
 _PLANETILER_AUX_SOURCES = {
     "lake_centerlines_path": "lake_centerline.shp.zip",
     "water_polygons_path": "water-polygons-split-3857.zip",
     "natural_earth_path": "natural_earth_vector.sqlite.zip",
 }
+
+# Planetiler downloads these itself, given --only-download, and skips any
+# that are already present (there are separate --refresh-* flags to force
+# a re-fetch, which is why this is safe to call whenever something is
+# missing). Letting it do the fetching rather than curl-ing the three URLs
+# ourselves keeps the file versions matched to the jar: the Natural Earth
+# and water-polygon URLs are pinned inside Planetiler and change between
+# releases, so a hand-maintained copy of them here would silently drift
+# out of step at the next version bump.
+_PLANETILER_DOWNLOAD_ARGS = ["--only-download", "--download"]
 
 
 class _HillshadeProvenance(object):
@@ -304,8 +316,25 @@ class MapLibreBundle(object):
         dem_cache=None,
         dem_arcsec=DEFAULT_ARCSEC,
         dem_missing_policy=DEFAULT_POLICY,
+        osm_cache=None,
+        allow_download=True,
     ):
         """
+        allow_download: whether this worker may fetch Planetiler's
+                    auxiliary sources if they are not cached yet. The OSM
+                    extracts have the same switch inside osm_cache; the
+                    server passes one config value to both, since an
+                    air-gapped worker needs both off and there is no
+                    sensible deployment that wants one without the other.
+
+        osm_cache:  an OsmExtractCache, which resolves the job's bounds to
+                    the Geofabrik region(s) covering them and downloads
+                    those on first use. Injected rather than constructed
+                    here so the server can apply its configured download
+                    limits (see server/config.py) while bin/mapgen and the
+                    tests get plain defaults - the same reason dem_cache
+                    is a parameter.
+
         dem_cache:  the job's shared DemCache. Passing the same instance
                     used for terrain.jp2 is what lets the provenance report
                     show both consumers side by side - historically they
@@ -320,12 +349,12 @@ class MapLibreBundle(object):
 
         dir_data:   the shared mapgen data cache (Generator's dir_data -
                     same role as the cache Downloader/srtm.py already use
-                    for terrain tiles). The regional OSM extract
-                    (data/osm/*.osm.pbf), the Planetiler auxiliary sources
-                    (data/planetiler-sources/) and the elevation tiles
-                    (data/dem/ for Sonny's LiDAR tiles, data/dem3/ for the
-                    existing SRTM cache) are all read from here - fetched
-                    once by an operator, not per job.
+                    for terrain tiles). The regional OSM extracts
+                    (data/osm/geofabrik/), the Planetiler auxiliary
+                    sources (data/planetiler-sources/) and the elevation
+                    tiles (data/dem/ for Sonny's LiDAR tiles, data/dem3/
+                    for the existing SRTM cache) are all read from here -
+                    fetched once, then reused by every later job.
         dir_temp:   this job's scratch directory (same one passed to
                     Generator).
         dir_static: pre-built, job-independent assets shared by every job
@@ -340,9 +369,12 @@ class MapLibreBundle(object):
         self.__dem_cache = dem_cache or DemCache(dir_data)
         self.__dem_arcsec = dem_arcsec
         self.__dem_missing_policy = dem_missing_policy
-        # Filled in by build() so the caller can fold this into the job's
-        # provenance report - see provenance_lines().
+        self.__osm_cache = osm_cache or OsmExtractCache(dir_data)
+        self.__allow_download = allow_download
+        # Filled in by build() so the caller can fold these into the job's
+        # provenance report - see provenance_sections().
         self.__provenance = None
+        self.__osm_provenance = None
 
     def build(self, bounds, name="XCSoar map", min_zoom=DEFAULT_MIN_ZOOM,
               max_zoom=DEFAULT_MAX_ZOOM, also_unpack_flat_tiles=False,
@@ -441,6 +473,23 @@ class MapLibreBundle(object):
         """The _HillshadeProvenance for the last build(), or None."""
         return self.__provenance
 
+    def provenance_sections(self):
+        """
+        Every provenance section from the last build(), as lists of lines.
+
+        Two sections, because the bundle has two independent data sources
+        and conflating them is exactly the mistake this reporting exists
+        to prevent: the hillshade comes from the DEM cache, the vector
+        basemap from one or more Geofabrik extracts, and "which data is
+        this map built from?" has a different answer for each.
+        """
+        sections = []
+        if self.__provenance:
+            sections.append(self.__provenance.lines())
+        if self.__osm_provenance:
+            sections.append(self.__osm_provenance)
+        return sections
+
     def __write_provenance(self):
         """
         Writes the report into the bundle itself, so the answer travels
@@ -451,96 +500,138 @@ class MapLibreBundle(object):
         """
         spew(
             os.path.join(self.__bundle_dir, "PROVENANCE.txt"),
-            self.__provenance.text(),
+            "\n\n".join(
+                "\n".join(section) for section in self.provenance_sections()
+            )
+            + "\n",
         )
 
     # ---- OSM extract --------------------------------------------------
 
-    def __locate_region_pbf(self):
-        """
-        The operator-maintained regional .osm.pbf lives directly under
-        dir_data/osm/ (e.g. a Geofabrik "rhone-alpes-<date>.osm.pbf"
-        extract - the exact filename varies by download date/region, so
-        this is not hardcoded). "region.osm.pbf" is checked first as a
-        stable name an operator can symlink/rename to, to avoid ambiguity
-        across multiple cached extracts.
-        """
-        osm_dir = os.path.join(self.__dir_data, "osm")
-        preferred = os.path.join(osm_dir, "region.osm.pbf")
-        if os.path.exists(preferred):
-            return preferred
-
-        candidates = sorted(glob.glob(os.path.join(osm_dir, "*.osm.pbf")))
-        if len(candidates) == 1:
-            return candidates[0]
-        if len(candidates) > 1:
-            raise RuntimeError(
-                "Multiple .osm.pbf files found in {}: {}. Either remove "
-                "the ones you don't want, or symlink the one to use as "
-                "region.osm.pbf.".format(osm_dir, ", ".join(candidates))
-            )
-        raise RuntimeError(
-            "No regional .osm.pbf found in {}. See docs/DATA_SOURCES.md "
-            "to pre-fetch a Geofabrik regional extract before enabling "
-            "--maplibre.".format(osm_dir)
-        )
-
     def __extract_osm(self, bounds):
         """
-        Clips the operator-maintained regional .osm.pbf (e.g. Geofabrik's
-        rhone-alpes extract, refreshed outside of job time) down to this
-        job's bounding box. The multi-hundred-MB regional file is
-        downloaded once by the operator; every job just clips it, so
-        building a map never needs network access.
-        """
-        region_pbf = self.__locate_region_pbf()
+        Produces this job's bbox-clipped .osm.pbf.
 
-        out_pbf = os.path.join(self.__dir_temp, "extract.osm.pbf")
-        bbox = "{},{},{},{}".format(
-            bounds.left, bounds.bottom, bounds.right, bounds.top
+        All of the work - deciding which Geofabrik region(s) cover these
+        bounds, downloading any that are not cached yet, clipping, and
+        merging when the bounds straddle a border - lives in
+        osm_extracts.py. This module used to pick the source file itself,
+        by globbing for whatever single .osm.pbf an operator had dropped
+        into data/osm/, which meant a job whose bounds fell outside that
+        one region produced a bundle with empty vector tiles and said
+        nothing about it.
+        """
+        out_pbf, region_ids = self.__osm_cache.extract_for(
+            bounds, self.__dir_temp
         )
-        subprocess.check_call([
-            _CMD_OSMIUM, "extract",
-            "--bbox", bbox,
-            "--strategy", "smart",
-            "--overwrite",
-            "-o", out_pbf,
-            region_pbf,
-        ])
+        self.__osm_provenance = [
+            "=== OSM provenance (MapLibre vector basemap) ===",
+            "regions:   {}".format(", ".join(region_ids)),
+            "clipped:   {:g},{:g} -> {:g},{:g}".format(
+                bounds.left, bounds.bottom, bounds.right, bounds.top
+            ),
+        ]
         return out_pbf
 
     # ---- vector tiles (Planetiler, OpenMapTiles schema) ----------------
 
-    def __locate_planetiler_aux_sources(self):
+    def __locate_planetiler_aux_sources(self, pbf_extract):
         """
         The plain planetiler.jar defaults to the OpenMapTiles profile, but
-        that profile needs 3 small *global* auxiliary datasets (lake
+        that profile needs 3 *global* auxiliary datasets (lake
         centerlines, split water polygons, Natural Earth) in addition to
         the regional OSM extract, to render coastlines/lakes correctly at
-        low zoom. These are job-independent, so - exactly like the OSM
-        extract and DEM tiles - an operator fetches them once into
-        dir_data/planetiler-sources/ and every job just reuses them
-        (planetiler is invoked without --download, so a job never touches
-        the network). See docs/GENERATE_TEST_BUNDLE.md for the fetch
-        command.
+        low zoom.
+
+        They are job-independent and total ~1.4 GB, so they are fetched
+        once into dir_data/planetiler-sources/ and reused by every later
+        job - the same cache model as the OSM extracts and DEM tiles.
+        This used to be a hard error telling the operator to go and run a
+        documented command by hand; now the first job that needs them
+        fetches them.
         """
         aux_dir = os.path.join(self.__dir_data, "planetiler-sources")
-        paths = {}
-        missing = []
-        for arg_name, filename in _PLANETILER_AUX_SOURCES.items():
-            path = os.path.join(aux_dir, filename)
-            if not os.path.exists(path):
-                missing.append(filename)
-            paths[arg_name] = path
+        paths = {
+            arg_name: os.path.join(aux_dir, filename)
+            for arg_name, filename in _PLANETILER_AUX_SOURCES.items()
+        }
+
+        if self.__missing_aux_sources(paths):
+            self.__download_planetiler_aux_sources(paths, pbf_extract)
+
+        missing = self.__missing_aux_sources(paths)
         if missing:
             raise RuntimeError(
-                "Missing Planetiler auxiliary source(s) in {}: {}. These "
-                "are one-time, job-independent downloads - see "
-                "docs/GENERATE_TEST_BUNDLE.md for the fetch command "
-                "(run once with --download, then every job reuses the "
-                "cache).".format(aux_dir, ", ".join(missing))
+                "Planetiler auxiliary source(s) still missing from {} "
+                "after the download attempt: {}. These are a one-time, "
+                "job-independent ~1.4 GB fetch; check the worker's "
+                "network access (behind a proxy, Java needs it passed "
+                "explicitly - see container/worker/planetiler).".format(
+                    aux_dir, ", ".join(missing)
+                )
             )
         return paths
+
+    @staticmethod
+    def __missing_aux_sources(paths):
+        return sorted(
+            os.path.basename(path)
+            for path in paths.values()
+            if not os.path.exists(path)
+        )
+
+    def __download_planetiler_aux_sources(self, paths, pbf_extract):
+        """
+        Fetches whatever of the three is missing, via planetiler itself.
+
+        `--osm-path` is passed even though nothing is being built from it:
+        without one, planetiler falls back to resolving its default
+        `area=monaco` against Geofabrik's index over the network, which is
+        both pointless here and the step that fails first on a worker
+        behind a proxy. Handing it the extract this job already has avoids
+        the lookup entirely.
+
+        Locked, because this is ~1.4 GB and bin/mapgen can be run
+        concurrently against the same data volume; and re-checked inside
+        the lock, since whoever we queued behind was very likely fetching
+        exactly these files.
+        """
+        if not self.__allow_download:
+            raise RuntimeError(
+                "Planetiler auxiliary source(s) missing from {} and "
+                "downloads are disabled: {}. Fetch them onto this worker "
+                "or re-enable downloads.".format(
+                    os.path.join(self.__dir_data, "planetiler-sources"),
+                    ", ".join(self.__missing_aux_sources(paths)),
+                )
+            )
+
+        with FileLock(self.__dir_data, "planetiler-sources"):
+            missing = self.__missing_aux_sources(paths)
+            if not missing:
+                return
+            os.makedirs(
+                os.path.join(self.__dir_data, "planetiler-sources"),
+                exist_ok=True,
+            )
+            print(
+                "Fetching {} of Planetiler's 3 auxiliary sources ({}); "
+                "one-time, then shared by every later job...".format(
+                    len(missing), ", ".join(missing)
+                )
+            )
+            # Flushed because planetiler writes straight to the inherited
+            # fd while this process's stdout is block-buffered, so without
+            # it the "fetching" line lands *after* the download it is
+            # announcing - which is exactly backwards when the log is
+            # being read to work out why a job stalled.
+            sys.stdout.flush()
+            args = [_CMD_PLANETILER] + _PLANETILER_DOWNLOAD_ARGS + [
+                "--osm-path=" + pbf_extract
+            ]
+            for arg_name, path in paths.items():
+                args.append("--{}={}".format(arg_name, path))
+            subprocess.check_call(args)
 
     def __build_vector_tiles(self, pbf_extract, bounds, min_zoom, max_zoom):
         """
@@ -557,7 +648,7 @@ class MapLibreBundle(object):
         much (or how little) OSM data the extract actually contains.
         """
         mbtiles = os.path.join(self.__bundle_dir, "basemap.mbtiles")
-        aux_sources = self.__locate_planetiler_aux_sources()
+        aux_sources = self.__locate_planetiler_aux_sources(pbf_extract)
 
         args = [
             _CMD_PLANETILER,
