@@ -29,9 +29,61 @@ MapLibre hillshade.
 - Practical note: the download links on the site are Google Drive folders,
   not directly `wget`-able; a human needs to click through once per
   country/resolution to grab the zip(s) covering the test area, then those
-  files go into mapgen's local data cache for reuse across jobs.
+  files go into mapgen's local data cache for reuse across jobs. If that
+  manual step is the problem, see viewfinderpanoramas.org below — near
+  identical data over the Alps, and scriptable.
 - The site's own comparison page links example LiDAR-vs-SRTM renders if
   you want to see the accuracy difference before committing to a data set.
+
+### viewfinderpanoramas.org — https://viewfinderpanoramas.org/dem3.html (the scriptable 1" source)
+
+Jonathan de Ferranti's DEMs, void-filled from topographic mapping and, for
+Europe, rebuilt from the same national LiDAR releases Sonny draws on. The
+1" set is the same `<n|s>NN<e|w>NNN.hgt` tiling as Sonny's, so it is a
+drop-in for `data/dem/` too — but unlike Sonny's Google Drive folders it
+sits at plain URLs, which is the whole reason to care about it.
+
+**It is downloadable by script.** Tiles are packed into 4°×6° zips named
+by a latitude band letter (A = 0–4°, B = 4–8°, …) plus a UTM-style
+longitude zone (1 = 180°W–174°W), with an `S` prefix in the southern
+hemisphere: `https://viewfinderpanoramas.org/dem1/L32.zip`. Two traps —
+the `S` prefix collides with band S (72–76°N), told apart by letter count
+(`S19` northern, `SK59` southern); and a southern cell's SW corner sits on
+the far edge of its band, so `S44E170` is in `SK59`, not `SL59`. The zip's
+inner folder drops the prefix (`SK59.zip` holds `K59/`).
+`bin/mapgen-dem1-fetch` implements all of this — give it a bbox and it
+fetches, extracts and caches only the cells you need.
+
+Coverage is **not** global: roughly Europe (to about Ukraine), North
+America, Japan, New Zealand and the Himalaya. 309 zips, ~25 GB for the
+whole 1" archive, ~80 MB each. Blocks outside coverage return 404, and
+seven links on the coverage map are dead (`H11 M01 N01`–`N05`).
+
+Quality, measured against Sonny on the four overlapping Alpine cells: mean
+difference under 1 m, std 1.7–4.3 m, 92–98 % of pixels within 5 m. It is
+genuinely native 1", not upsampled 3" — a period-3 resampling signature
+test scores ~1.0 (as Sonny does) against 0.03 for a real 3"→1" upsample.
+For anywhere Sonny does not cover (Japan, New Zealand, North America)
+this is the only free 1" `.hgt` option, and it tests as native there too.
+
+The one real difference: **water is void** (`-32768`), where Sonny is
+void-free — about 1.5 % of a valley tile, essentially zero in high alpine
+terrain. Both DEM consumers mishandle that, the hillshade badly (the
+Terrain-RGB packer encodes a void as −10 000 m and box-blurs it into the
+surrounding terrain first, so every lake becomes a crater), so
+`mapgen-dem1-fetch` interpolates the voids away before caching unless you
+pass `--no-fill`. Filled tiles match Sonny to std ~6 m with 92 % of pixels
+within 5 m — the same agreement as on pixels neither source voided.
+
+- Terms of use: custom, not a standard open license. Data "may be
+  reproduced for research and private use"; redistribution requires "an
+  acknowledgement with a link to the appropriate source page" or written
+  permission; "limited commercial use is OK, but anyone contemplating
+  large scale reproduction should contact me". Since mapgen bakes DEM data
+  into every `.xcm` it ships, that acknowledgement is not optional — and
+  note the terms call out flight-simulator mesh distribution specifically,
+  which is close enough to XCSoar's use to be worth reading directly if
+  these maps are published rather than built locally.
 
 ### IGN France (Institut national de l'information géographique et
 forestière) — official French mapping agency, open data
@@ -108,13 +160,14 @@ bottom = 45.85
 ```
 
 (this is the `left right top bottom` order mapgen's `-b` flag already
-expects — see `docs/GENERATE_TEST_BUNDLE.md`)
+expects)
 
 ## License summary
 
 | Source | License | Attribution needed |
 |---|---|---|
 | Sonny's LiDAR DTMs | CC BY 4.0 | Yes — "Sonny", link to sonny.4lima.de |
+| viewfinderpanoramas.org | Custom site terms of use (not CC) | Yes — credit Jonathan de Ferranti with a link to the source page; contact him before large-scale redistribution |
 | IGN RGE ALTI / BD ALTI / BD ORTHO / BD TOPO | Licence Ouverte / Etalab 2.0 | Credit IGN |
 | Copernicus GLO-30 | Copernicus / ESA open data license | Credit Copernicus |
 | OpenStreetMap (via Geofabrik) | ODbL | Credit OpenStreetMap contributors (already required today for mapgen's topology output) |

@@ -1,0 +1,278 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+# Fetches 1-arcsec .hgt tiles from viewfinderpanoramas.org into the dem/
+# tier of the local data cache.
+#
+# dem/ is the one tier Downloader cannot fill (see terrain/dem_cache.py):
+# the server manifest has zero dem/ entries, so 1" data has always been
+# an operator copying files in by hand. Sonny's tiles - the usual source -
+# are behind Google Drive folders and genuinely not wget-able, which is
+# why that stayed manual.
+#
+# viewfinderpanoramas.org publishes the same 1"x1-degree .hgt tiles at
+# plain, predictable URLs, so this part can be scripted. Coverage is not
+# global: roughly Europe, North America, Japan, New Zealand and the
+# Himalaya. A block with no coverage 404s, which is treated as "nothing
+# here", not as an error.
+#
+# Tiles already present in dem/ are left alone - where Sonny and
+# viewfinder overlap the two agree to within a couple of metres, so
+# re-fetching would churn the cache for nothing. Use --force to override.
+#
+# Unlike Sonny's tiles these carry voids (-32768) over water, which both
+# DEM consumers mishandle, so they are interpolated away before caching
+# (see fill_voids). That is the default rather than an opt-in because a
+# tile cached with its voids intact looks perfectly fine until it reaches
+# the hillshade, where every lake turns into a -10000 m crater - a
+# failure that surfaces a long way from its cause. --no-fill opts out.
+
+import argparse
+import io
+import os
+import re
+import sys
+import zipfile
+
+from urllib.request import urlopen
+from urllib.error import HTTPError
+
+app_dir = os.path.abspath(__file__ + "/../..")
+sys.path.append(os.path.join(app_dir, "lib"))
+
+from xcsoar.mapgen.terrain.dem_cache import TIERS, cell_name
+
+BASE_URL = "https://viewfinderpanoramas.org/dem1/"
+
+# The 1" tier, by arcsec rather than by index, so a reordering of TIERS
+# cannot silently point this at dem3/.
+DEM1 = [t for t in TIERS if t.arcsec == 1][0]
+
+NODATA = -32768
+
+# Pixels, so ~18 km at 1 arcsec. Sized off the largest void actually
+# observed (Lac du Bourget, ~430 px across); at 100 px that tile still
+# had 1150 pixels left over, at 600 none.
+FILL_MAX_DISTANCE = 600
+
+
+def block_name(lat, lon):
+    """
+    Name of the zip covering the 1-degree cell at (lat, lon).
+
+    Blocks are 4 degrees of latitude by 6 of longitude: a letter for the
+    latitude band (A = 0-4 degrees, B = 4-8, ...) and a UTM-style zone
+    number for the longitude (1 = 180W-174W). Southern-hemisphere blocks
+    take an "S" prefix.
+
+    That prefix collides with band S (72-76N), so the two are told apart
+    by letter count - "S19" is northern, "SK59" is southern. Note the
+    prefix is not repeated inside the archive: SK59.zip holds a K59/
+    folder.
+    """
+    # Bands are indexed from the equator outwards, and (lat, lon) is a
+    # cell's SW corner, so south of the equator the corner sits on the
+    # band's far edge: S44 belongs to K (44S-40S), not L.
+    lat = int(lat)
+    band = (abs(lat) - 1) // 4 if lat < 0 else lat // 4
+    zone = int((lon + 180) // 6) + 1
+    return ("S" if lat < 0 else "") + chr(ord("A") + band) + "{:02d}".format(zone)
+
+
+def blocks_for(lat_min, lat_max, lon_min, lon_max):
+    """Blocks covering a bbox, each with the cells wanted from it."""
+    blocks = {}
+    for lat in range(int(lat_min // 1), int(lat_max // 1) + 1):
+        for lon in range(int(lon_min // 1), int(lon_max // 1) + 1):
+            blocks.setdefault(block_name(lat, lon), []).append((lat, lon))
+    return blocks
+
+
+def fill_voids(data, name):
+    """
+    Interpolate away the -32768 water voids, returning replacement .hgt
+    bytes.
+
+    Both DEM consumers get this wrong in different ways, so it has to
+    happen before the tile lands in the cache rather than downstream:
+    terrain.jp2's gdalwarp turns the voids into XCSoar's -31744 "unknown"
+    and smears the edge with its cubic kernel, while the MapLibre
+    Terrain-RGB packer clips -32768 to the bottom of its range and encodes
+    it as -10000 m - and it box-blurs first, so one void pixel drags its
+    neighbours down with it. Every lake would be a crater.
+
+    Plain inverse-distance interpolation from the shoreline, no attempt to
+    classify water: the elevation of a void is pinned by the ring of valid
+    pixels around it, which is all the information there is. Against
+    Sonny's void-free tiles this lands the whole tile within std ~6 m and
+    92% under 5 m - indistinguishable from the agreement on pixels neither
+    source voided.
+
+    The SRTMHGT driver derives a tile's georeferencing from its filename
+    and refuses to write under any other name, so both ends of the
+    round-trip are named for the cell.
+    """
+    # -32768 is 0x8000 big-endian, so its absence from the bytes proves
+    # the tile has no voids. The converse does not hold - the pair can
+    # straddle two innocent samples - but a needless fill is only slow,
+    # never wrong, and most inland tiles take this exit.
+    if b"\x80\x00" not in data:
+        return data
+
+    from osgeo import gdal
+
+    gdal.UseExceptions()
+
+    src = "/vsimem/dem1-in/{}.hgt".format(name)
+    dst = "/vsimem/dem1-out/{}.hgt".format(name)
+    gdal.FileFromMemBuffer(src, data)
+    try:
+        scratch = gdal.Translate("", gdal.Open(src), format="MEM", noData=NODATA)
+        band = scratch.GetRasterBand(1)
+        gdal.FillNodata(band, None, FILL_MAX_DISTANCE, 0)
+
+        # Anything still void would be a hole no shoreline could reach.
+        # Statistics skip the nodata value, so it has to be cleared first
+        # for the minimum to reveal one.
+        band.DeleteNoDataValue()
+        if band.ComputeRasterMinMax(False)[0] <= NODATA:
+            print("  {}: voids remain after fill".format(name), file=sys.stderr)
+
+        gdal.GetDriverByName("SRTMHGT").CreateCopy(dst, scratch)
+        scratch = None
+
+        handle = gdal.VSIFOpenL(dst, "rb")
+        try:
+            gdal.VSIFSeekL(handle, 0, os.SEEK_END)
+            size = gdal.VSIFTellL(handle)
+            gdal.VSIFSeekL(handle, 0, os.SEEK_SET)
+            return bytes(gdal.VSIFReadL(1, size, handle))
+        finally:
+            gdal.VSIFCloseL(handle)
+    finally:
+        gdal.Unlink(src)
+        gdal.Unlink(dst)
+
+
+def wanted(cells, force, dir_dem):
+    """The subset of cells not already on disk."""
+    if force:
+        return cells
+    return [c for c in cells if not os.path.exists(DEM1.path(dir_dem, *c))]
+
+
+def fetch_block(name, cells, dir_data, dry_run, fill):
+    """
+    Download one block and extract just `cells` from it.
+
+    The whole zip has to come down regardless - the server supports byte
+    ranges but the central directory offsets are not worth the extra
+    round trips for an ~80 MB archive - so it is streamed to memory and
+    only the wanted members are written out.
+    """
+    url = BASE_URL + name + ".zip"
+    if dry_run:
+        print("  would fetch {}".format(url))
+        return 0
+
+    try:
+        with urlopen(url, timeout=120) as response:
+            payload = response.read()
+    except HTTPError as e:
+        if e.code == 404:
+            print("  {}: no coverage".format(name))
+            return 0
+        raise
+
+    dest_dir = os.path.join(dir_data, DEM1.subdir)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # Member paths carry a folder that does not always match the zip name,
+    # so cells are matched on the basename alone.
+    written = 0
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        members = {os.path.basename(m): m for m in archive.namelist()}
+        for lat, lon in cells:
+            member = members.get(cell_name(lat, lon) + ".hgt")
+            if not member:
+                continue
+            data = archive.read(member)
+            if len(data) != DEM1.file_size:
+                print(
+                    "  {}: unexpected size {}, skipped".format(member, len(data)),
+                    file=sys.stderr,
+                )
+                continue
+            if fill:
+                data = fill_voids(data, cell_name(lat, lon))
+            with open(DEM1.path(dir_data, lat, lon), "wb") as out:
+                out.write(data)
+            written += 1
+
+    print("  {}: {} tile(s)".format(name, written))
+    return written
+
+
+def parse_bbox(text):
+    parts = [float(p) for p in re.split(r"[,\s]+", text.strip()) if p]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("expected 'lat_min,lat_max,lon_min,lon_max'")
+    lat_min, lat_max, lon_min, lon_max = parts
+    if lat_min > lat_max or lon_min > lon_max:
+        raise argparse.ArgumentTypeError("min values must not exceed max values")
+    return lat_min, lat_max, lon_min, lon_max
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch 1-arcsec DEM tiles from viewfinderpanoramas.org."
+    )
+    parser.add_argument(
+        "bbox",
+        type=parse_bbox,
+        help="area to cover, as 'lat_min,lat_max,lon_min,lon_max'",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=os.path.expanduser("~/.xcsoar_mapgen/mapgen-data"),
+        help="root of the data cache (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="re-fetch cells already present in dem/",
+    )
+    parser.add_argument(
+        "--no-fill",
+        dest="fill",
+        action="store_false",
+        help="cache the tiles with their -32768 water voids intact; only "
+        "useful for feeding something that handles nodata itself, since "
+        "the MapLibre terrain packer encodes a void as -10000 m",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be fetched, download nothing",
+    )
+    args = parser.parse_args()
+
+    dir_data = os.path.abspath(args.data_dir)
+    blocks = blocks_for(*args.bbox)
+
+    total = 0
+    for name in sorted(blocks):
+        cells = wanted(blocks[name], args.force, dir_data)
+        if not cells:
+            print("  {}: already cached".format(name))
+            continue
+        total += fetch_block(name, cells, dir_data, args.dry_run, args.fill)
+
+    print(
+        "{} tile(s) written to {}/".format(total, os.path.join(dir_data, DEM1.subdir))
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

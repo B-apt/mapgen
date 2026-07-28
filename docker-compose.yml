@@ -4,13 +4,22 @@ services:
     build:
       context: .
       dockerfile: ./container/frontend/Dockerfile
+      # Docker's predefined proxy build args: empty here by default
+      # no-op for a normal deployment, Set the values in a local .env file.
+      args:
+        http_proxy: ${http_proxy:-}
+        https_proxy: ${https_proxy:-}
+        no_proxy: ${no_proxy:-}
     image: ghcr.io/xcsoar/mapgen-frontend
     ports:
       - "9090:9090"
+    environment:
+      - http_proxy=${http_proxy:-}
+      - https_proxy=${https_proxy:-}
+      - no_proxy=${no_proxy:-}
     volumes:
       - mapgen-jobs:/opt/mapgen/jobs
-      - ./lib:/opt/mapgen/lib
-      - ./bin:/opt/mapgen/bin
+
   mapgen-worker:
     build:
       context: .
@@ -32,19 +41,7 @@ services:
     volumes:
       - mapgen-jobs:/opt/mapgen/jobs
       - mapgen-data:/opt/mapgen/data
-      - ./lib:/opt/mapgen/lib
-      - ./bin:/opt/mapgen/bin
 
 volumes:
   mapgen-data:
-      driver: local
-      driver_opts:
-        type: none
-        o: bind
-        device: /home/bapt/.xcsoar_mapgen/mapgen-data
   mapgen-jobs:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /home/bapt/.xcsoar_mapgen/mapgen-jobs

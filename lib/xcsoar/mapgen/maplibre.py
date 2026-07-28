@@ -39,8 +39,7 @@
 # The OSM extract is no longer an operator prerequisite - osm_extracts.py
 # derives the Geofabrik region(s) from the job's own bounds and fetches
 # them on first use. See docs/DATA_SOURCES.md for the elevation tiles,
-# which still are, and docs/GENERATE_TEST_BUNDLE.md for an end-to-end
-# walkthrough.
+# which still are.
 
 import gzip
 import json
@@ -132,8 +131,9 @@ _PACK_BLOCK_BYTES = 256 * 1024 * 1024
 # Global, job-independent source files the default Planetiler OpenMapTiles
 # profile needs in addition to the regional OSM extract (low-zoom water/
 # lake rendering). Same "fetch once, every later job reuses the cache"
-# model as data/osm/geofabrik and data/dem3 - see
-# docs/GENERATE_TEST_BUNDLE.md for the one-time fetch command.
+# model as data/osm/geofabrik and data/dem3, and like them it needs no
+# operator step: the first job that finds them missing pulls them itself
+# (~1.4 GB total, see __locate_planetiler_aux_sources below).
 _PLANETILER_AUX_SOURCES = {
     "lake_centerlines_path": "lake_centerline.shp.zip",
     "water_polygons_path": "water-polygons-split-3857.zip",

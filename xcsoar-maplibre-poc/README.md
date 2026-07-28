@@ -73,8 +73,7 @@ Nothing above ever makes a network call at XCSoar runtime:
   community pattern for shipping compact single-file offline tile packs,
   and the one this PoC's mapgen output is shaped for). (b) is Part 2 work;
   Part 1 produces both representations so you can start previewing
-  immediately without waiting for that code — see
-  `docs/GENERATE_TEST_BUNDLE.md`.
+  immediately without waiting for that code.
 
 ## Part 1 — what's in this folder
 
@@ -85,9 +84,7 @@ Nothing above ever makes a network call at XCSoar runtime:
 | `mapgen_patch/bin/mapgen-cli.md` | shape of the equivalent change to the interactive `bin/mapgen` CLI (illustrative — see note inside) |
 | `style/style.json.tmpl` | the MapLibre style template written into every bundle |
 | `hypsometric-restyle/` | how the terrain got elevation colour *and* kept its relief detail: measured colour ramp, hillshade tuning, and the render-compare tooling |
-| `scripts/build_test_area.sh` | orchestrates a full test build for a small French Alps area |
 | `docs/DATA_SOURCES.md` | where to freely get high-resolution elevation + imagery + vector data for the French Alps (and elsewhere) |
-| `docs/GENERATE_TEST_BUNDLE.md` | step-by-step: produce and sanity-check a real test bundle |
 
 ## What mapgen already does (for context)
 

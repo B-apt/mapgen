@@ -196,9 +196,7 @@ resolution" below for why it is opt-in.
 `docker compose up -d` and the checkbox on the web form (or `bin/mapgen
 --maplibre`) works with no setup beyond the volumes; the first bundle a
 worker builds is slower while it populates its caches. See
-`xcsoar-maplibre-poc/README.md` for the design rationale and
-`xcsoar-maplibre-poc/docs/GENERATE_TEST_BUNDLE.md` for a full walkthrough
-with a validation script.
+`xcsoar-maplibre-poc/README.md` for the design rationale.
 
 ### Elevation data resolution
 
