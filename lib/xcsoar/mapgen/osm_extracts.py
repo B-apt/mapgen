@@ -604,6 +604,19 @@ class GeofabrikIndex(object):
 # --- the cache -----------------------------------------------------------
 
 
+def require_osmium():
+    """Fail as a skippable OsmExtractError, not a subprocess traceback."""
+    try:
+        subprocess.check_output(
+            ["which", _CMD_OSMIUM], stderr=subprocess.STDOUT
+        )
+    except (subprocess.CalledProcessError, OSError):
+        raise OsmExtractError(
+            "{} is not on the $PATH - install osmium-tool to build the "
+            "MapLibre vector basemap.".format(_CMD_OSMIUM)
+        )
+
+
 def human_bytes(count):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if count < 1024 or unit == "TB":
@@ -797,8 +810,15 @@ class OsmExtractCache(object):
         500 MB national extracts and then clipping would work, but it
         moves an order of magnitude more data through osmium than merging
         two 20 MB clips does - and the merge is the expensive half.
-        `osmium merge` drops duplicate objects, which is what makes this
-        safe across a border where both extracts contain the same ways.
+
+        The merge is `osmium merge-changes --simplify` rather than plain
+        `osmium merge`, because Geofabrik cuts each region at its own
+        time: a node edited between the two snapshots appears as v4 in one
+        extract and v5 in the other. `osmium merge` only drops duplicates
+        that match on version too, so both survive, and Planetiler's node
+        map rejects the repeated id ("Nodes must be sorted ascending by
+        ID, N came after N"). --simplify keeps the newest version of each
+        object, which is what a merged extract should contain anyway.
         """
         require_osmium()
         regions = self.select(bounds)
@@ -830,7 +850,8 @@ class OsmExtractCache(object):
         if len(clips) > 1:
             print("Merging {} clipped extracts ...".format(len(clips)))
             subprocess.check_call(
-                [_CMD_OSMIUM, "merge", "--overwrite", "-o", out_path] + clips
+                [_CMD_OSMIUM, "merge-changes", "--simplify", "--overwrite",
+                 "-o", out_path] + clips
             )
             for clip in clips:
                 os.unlink(clip)

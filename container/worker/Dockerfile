@@ -2,6 +2,9 @@
 FROM debian:bullseye-slim
 ENV MAPWRK_PKGS="ca-certificates python3-jsonschema python3-requests p7zip gdal-bin python3-gdal mapserver-bin wget osmium-tool sqlite3 python3-pip vim less curl unzip"
 ENV DEBIAN_FRONTEND=noninteractive
+# Without this the worker's own prints - including the traceback of a
+# failed job - sit in a buffer and never reach `docker logs`.
+ENV PYTHONUNBUFFERED=1
 
 # install base packages needed for mapgen
 # python3-gdal provides gdal2tiles.py's osgeo bindings (gdal-bin alone

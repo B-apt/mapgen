@@ -25,6 +25,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 
+from xcsoar.mapgen import osm_extracts  # noqa: E402
 from xcsoar.mapgen.georect import GeoRect  # noqa: E402
 from xcsoar.mapgen.osm_extracts import (  # noqa: E402
     GeofabrikIndex,
@@ -275,6 +276,39 @@ class TestCache(unittest.TestCase):
         self.assertIn("europe/france/rhone-alpes", message)
         self.assertIn("500.0 MB", message)
         self.assertIn("100.0 MB", message)
+
+    def test_cross_border_merge_drops_objects_edited_between_snapshots(self):
+        """
+        Geofabrik cuts each region at its own time, so a node edited in
+        between is v4 in one extract and v5 in the other. Plain `osmium
+        merge` keeps both (it matches on version too) and Planetiler then
+        dies on the repeated id, having already burnt the download and
+        clip. --simplify is what collapses them.
+        """
+        cache = self.cache()
+        bounds = GeoRect(left=5.5, right=7.5, top=46.5, bottom=45.9)
+        for region_id in ("europe/france/rhone-alpes", "europe/switzerland"):
+            self.plant(cache, region_id)
+
+        calls = []
+
+        def fake_check_call(args, **kwargs):
+            calls.append(args)
+            open(args[args.index("-o") + 1], "wb").close()
+
+        original_call = osm_extracts.subprocess.check_call
+        original_output = osm_extracts.subprocess.check_output
+        osm_extracts.subprocess.check_call = fake_check_call
+        osm_extracts.subprocess.check_output = lambda *a, **kw: b""
+        try:
+            cache.extract_for(bounds, self.dir_data)
+        finally:
+            osm_extracts.subprocess.check_call = original_call
+            osm_extracts.subprocess.check_output = original_output
+
+        merge = calls[-1]
+        self.assertEqual(merge[1], "merge-changes")
+        self.assertIn("--simplify", merge)
 
     def test_size_guard_ignores_regions_already_cached(self):
         """
