@@ -23,7 +23,7 @@ docker compose build mapgen-worker
 ```
 
 No glyph generator (e.g. node-fontnik) is installed - prebuilt, OFL-licensed
-glyph PBFs are reused from the `openmaptiles/fonts` release instead (see
+glyph PBFs from the `openmaptiles/fonts` release are baked in instead (see
 step 2). `lib/` and `bin/` are bind-mounted into the container, so Python
 changes there are picked up immediately without a rebuild; only
 Dockerfile/dependency changes need `docker compose build`.
@@ -74,34 +74,18 @@ a `.env` file next to `docker-compose.yml` (git-ignored). Java does
 translates them into the `-D` properties the JVM honours, for both the
 build and the running container. See the main README.
 
-## 2. Build the one-time static assets (once, into `data/maplibre-static/`)
+## 2. Static style assets (nothing to do)
 
-Identical for every job, so built once directly into the shared data cache
-(no docker-compose changes needed - it's just another subdirectory of the
-volume that's already mounted):
+The sprite sheet (CC0 Maki icons), the font glyphs (prebuilt OFL-licensed
+Noto Sans PBF ranges from `openmaptiles/fonts` - no glyph generator
+needed in the image) and `style.json.tmpl` are baked into the worker
+image by `container/worker/Dockerfile`, at `/opt/mapgen/maplibre-static/`.
 
-```bash
-# style template
-cp style/style.json.tmpl /home/my-user/.xcsoar_mapgen/mapgen-data/maplibre-static/style.json.tmpl
-
-# glyphs: prebuilt, OFL-licensed PBF ranges (generated ahead of time with
-# node-fontnik by the openmaptiles/fonts project) - avoids needing a glyph
-# generator toolchain in the image at all
-curl -L -o noto-sans.zip https://github.com/openmaptiles/fonts/releases/download/v2.0/noto-sans.zip
-unzip -j noto-sans.zip 'Noto Sans Regular/*' -d /home/my-user/.xcsoar_mapgen/mapgen-data/maplibre-static/glyphs/'Noto Sans Regular'
-
-# sprites: CC0 Maki icon set, built with spreet (already in the image)
-curl -L -o maki.zip https://github.com/mapbox/maki/archive/refs/heads/main.zip
-unzip -j maki.zip 'maki-main/icons/*.svg' -d /tmp/maki_icons
-docker compose run --rm --no-deps -v /tmp/maki_icons:/workspace/maki_icons:ro \
-  --entrypoint bash mapgen-worker -c '
-    spreet /workspace/maki_icons /opt/mapgen/data/maplibre-static/sprites/sprite
-    spreet --ratio 2 /workspace/maki_icons /opt/mapgen/data/maplibre-static/sprites/sprite@2x
-  '
-```
-
-`bin/mapgen --maplibre-static` defaults to `<data>/maplibre-static`, so
-nothing else needs pointing at this directory.
+`style.json.tmpl` lives in the source tree (`style/style.json.tmpl`) and
+is baked in as the image's last layer, so iterating on it is a ~30kB
+rebuild. `--maplibre-static DIR` searches `DIR` first to try a variant
+without rebuilding; it resolves per asset, so a directory holding only a
+style template still gets its glyphs and sprites from the image.
 
 ## 3. Build the test bundle
 

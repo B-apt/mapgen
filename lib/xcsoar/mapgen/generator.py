@@ -271,7 +271,7 @@ author: {author}
 
     def add_maplibre(
         self,
-        dir_static,
+        dir_static=None,
         name="XCSoar map",
         min_zoom=0,
         max_zoom=14,
@@ -291,9 +291,9 @@ author: {author}
         ever used client-side to paint a decorative background texture
         underneath XCSoar's own terrain/topology/airspace rendering.
 
-        @param dir_static: directory of job-independent MapLibre assets
-                            (style.json.tmpl, sprites/, glyphs/) - see
-                            docs/GENERATE_TEST_BUNDLE.md.
+        @param dir_static: directory to search before the image's own
+                            copies of the MapLibre static assets
+                            (style.json.tmpl, sprites/, glyphs/), or None.
         @param osm_cache:  an OsmExtractCache carrying this deployment's
                             download limits, or None for the defaults.
         @param allow_download: whether missing MapLibre source data may be

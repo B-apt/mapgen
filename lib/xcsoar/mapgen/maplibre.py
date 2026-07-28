@@ -90,6 +90,11 @@ _CMD_GDAL2TILES = "gdal2tiles.py"
 DEFAULT_MIN_ZOOM = 0
 DEFAULT_MAX_ZOOM = 14
 
+# Sprites, glyphs and style.json.tmpl baked into the worker image by
+# container/worker/Dockerfile. Outside /opt/mapgen/lib and /opt/mapgen/bin
+# on purpose - docker-compose bind-mounts over both of those.
+BAKED_STATIC_DIR = "/opt/mapgen/maplibre-static"
+
 # Baking hillshade tiles at a deeper zoom than the source DEM's native
 # resolution supports doesn't add real detail - it just reprojects the
 # same coarse source grid into a much finer output grid, and every
@@ -312,7 +317,7 @@ class MapLibreBundle(object):
         self,
         dir_data,
         dir_temp,
-        dir_static,
+        dir_static=None,
         dem_cache=None,
         dem_arcsec=DEFAULT_ARCSEC,
         dem_missing_policy=DEFAULT_POLICY,
@@ -357,14 +362,19 @@ class MapLibreBundle(object):
                     fetched once, then reused by every later job.
         dir_temp:   this job's scratch directory (same one passed to
                     Generator).
-        dir_static: pre-built, job-independent assets shared by every job
-                    (sprite sheet, glyph pbf ranges, the style template).
-                    Built once - see docs/GENERATE_TEST_BUNDLE.md - and
-                    just copied in per job rather than regenerated.
+        dir_static: directory to look in before the image's own copies
+                    for the sprite sheet, glyph ranges and style
+                    template, or None to use just the image's.
         """
         self.__dir_data = dir_data
         self.__dir_temp = dir_temp
-        self.__dir_static = dir_static
+        if dir_static and not os.path.isdir(dir_static):
+            # Explicit path that does not exist is a typo, not something
+            # to quietly fall back from.
+            raise RuntimeError(
+                "MapLibre static asset directory not found: {}".format(dir_static)
+            )
+        self.__static_dirs = [d for d in (dir_static, BAKED_STATIC_DIR) if d]
         self.__bundle_dir = os.path.join(dir_temp, "maplibre")
         self.__dem_cache = dem_cache or DemCache(dir_data)
         self.__dem_arcsec = dem_arcsec
@@ -1075,22 +1085,42 @@ class MapLibreBundle(object):
 
     # ---- static, job-independent assets --------------------------------
 
+    def __find_static(self, name):
+        """
+        Locate one static asset: dir_static if the caller passed one,
+        then BAKED_STATIC_DIR. Resolved per asset, so an override
+        directory holding only style.json.tmpl still gets its glyphs and
+        sprites from the image. Returns None if neither has it.
+        """
+        for directory in self.__static_dirs:
+            path = os.path.join(directory, name)
+            if os.path.exists(path):
+                return path
+        return None
+
     def __copy_static_assets(self):
-        """
-        Sprites and glyphs are identical for every job, so they are built
-        once by an operator (see docs/GENERATE_TEST_BUNDLE.md) and just
-        copied in here rather than regenerated per map.
-        """
         for sub in ("sprites", "glyphs"):
-            src = os.path.join(self.__dir_static, sub)
-            dst = os.path.join(self.__bundle_dir, sub)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
+            src = self.__find_static(sub)
+            if src:
+                shutil.copytree(
+                    src, os.path.join(self.__bundle_dir, sub), dirs_exist_ok=True
+                )
+            else:
+                print("Warning: no {} found in {}".format(
+                    sub, ", ".join(self.__static_dirs)))
 
     # ---- style.json -----------------------------------------------------
 
     def __write_style_json(self, name, max_zoom, hillshade_max_zoom):
-        template_path = os.path.join(self.__dir_static, "style.json.tmpl")
+        template_path = self.__find_static("style.json.tmpl")
+        if not template_path:
+            raise RuntimeError(
+                "No style.json.tmpl found in {}. It ships in the worker "
+                "image; rebuild it (docker compose build mapgen-worker) or "
+                "point --maplibre-static at a directory holding one.".format(
+                    ", ".join(self.__static_dirs)
+                )
+            )
         style = json.loads(slurp(template_path))
         style["name"] = name
         for layer in style.get("layers", []):

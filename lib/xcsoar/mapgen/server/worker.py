@@ -103,7 +103,6 @@ This link is valid for 7 days.
             if description.maplibre:
                 job.update_status("Creating MapLibre bundle...")
                 generator.add_maplibre(
-                    dir_static=os.path.join(self.__dir_data, "maplibre-static"),
                     # Built here rather than inside the bundle so the
                     # deployment's download limits come from the server
                     # config, while bin/mapgen keeps library defaults.

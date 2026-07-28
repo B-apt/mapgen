@@ -109,8 +109,10 @@ def main():
         metavar="DIR",
         dest="maplibre_static",
         default=None,
-        help="directory of job-independent MapLibre assets (style "
-        "template, sprites, glyphs). Defaults to <data>/maplibre-static.",
+        help="directory to search before the worker image's own copies "
+        "of the MapLibre static assets (style.json.tmpl, sprites, "
+        "glyphs). Resolved per asset, so a directory holding only a "
+        "style template still gets its glyphs and sprites from the image.",
     )
     parser.add_argument(
         "--no-maplibre-download",
@@ -176,15 +178,12 @@ def main():
         if args.maplibre:
             # Optional, additive: only ever paints a visual base map layer.
             # Terrain/topology/waypoints/airspace above are untouched.
-            dir_static = args.maplibre_static or os.path.join(
-                app_dir, "data", "maplibre-static"
-            )
             maplibre_args = {}
             if args.max_zoom is not None:
                 maplibre_args["max_zoom"] = args.max_zoom
                 maplibre_args["max_zoom_source"] = "CLI --max-zoom"
             generator.add_maplibre(
-                dir_static=dir_static,
+                dir_static=args.maplibre_static,
                 name=args.output_file,
                 dem_arcsec=dem_arcsec,
                 dem_missing_policy=args.dem_missing_policy,

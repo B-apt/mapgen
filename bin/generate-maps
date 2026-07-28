@@ -51,7 +51,7 @@ def generate_map(
         # Optional, additive: only ever paints a visual base map layer.
         # Terrain/topology/waypoints/airspace above are untouched.
         generator.add_maplibre(
-            dir_static=dir_static or os.path.join(dir_data, "maplibre-static"),
+            dir_static=dir_static,
             name=name,
             dem_arcsec=dem_arcsec,
             dem_missing_policy=dem_missing_policy,
@@ -103,8 +103,10 @@ def main():
         metavar="DIR",
         dest="maplibre_static",
         default=None,
-        help="directory of job-independent MapLibre assets (style "
-        "template, sprites, glyphs). Defaults to <dir_data>/maplibre-static.",
+        help="directory to search before the worker image's own copies "
+        "of the MapLibre static assets (style.json.tmpl, sprites, "
+        "glyphs). Resolved per asset, so a directory holding only a "
+        "style template still gets its glyphs and sprites from the image.",
     )
     parser.add_argument(
         "--dem-arcsec",

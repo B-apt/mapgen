@@ -32,9 +32,30 @@ RUN curl -L -o /tmp/spreet.tar.gz \
     && chmod +x /usr/local/bin/spreet \
     && rm /tmp/spreet.tar.gz
 
+# MapLibre static assets (~35MB), identical for every job so baked in here.
+# Glyphs are prebuilt OFL PBF ranges - no glyph generator needed in the image.
+RUN curl -L -o /tmp/noto-sans.zip \
+        https://github.com/openmaptiles/fonts/releases/download/v2.0/noto-sans.zip \
+    && mkdir -p "/opt/mapgen/maplibre-static/glyphs/Noto Sans Regular" \
+    && unzip -j /tmp/noto-sans.zip 'Noto Sans Regular/*' \
+        -d "/opt/mapgen/maplibre-static/glyphs/Noto Sans Regular" \
+    && rm /tmp/noto-sans.zip
+
+# Sprites: CC0 Maki icon set packed with spreet (installed above)
+RUN curl -L -o /tmp/maki.zip \
+        https://github.com/mapbox/maki/archive/refs/heads/main.zip \
+    && unzip -j /tmp/maki.zip 'maki-main/icons/*.svg' -d /tmp/maki_icons \
+    && mkdir -p /opt/mapgen/maplibre-static/sprites \
+    && spreet /tmp/maki_icons /opt/mapgen/maplibre-static/sprites/sprite \
+    && spreet --ratio 2 /tmp/maki_icons /opt/mapgen/maplibre-static/sprites/sprite@2x \
+    && rm -rf /tmp/maki.zip /tmp/maki_icons
+
 # Copy python scripts of mapgen to target
 COPY lib/ /opt/mapgen/lib/
 COPY bin/ /opt/mapgen/bin/
+
+# Last layer: editing the style then rebuilds only this ~30kB layer
+COPY xcsoar-maplibre-poc/style/style.json.tmpl /opt/mapgen/maplibre-static/style.json.tmpl
 
 # Volume for data caching and jobs
 VOLUME /opt/mapgen/data

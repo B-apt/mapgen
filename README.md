@@ -111,12 +111,12 @@ purely a decorative background layer for future client-side rendering; it
 never changes how terrain/topology/waypoints/airspace themselves are
 built, and is off by default.
 
-`container/worker/Dockerfile` already installs everything the *build
-process* needs (osmium-tool, GDAL, a bundled Java 21 runtime + planetiler,
-spreet) - `docker compose build` picks that up automatically. The
-underlying map *data* is too large to ship in the image, so it is
-fetched into the data volume instead: step 1 below happens by itself,
-steps 2-4 are still one-time manual setup.
+`container/worker/Dockerfile` installs everything the *build process*
+needs (osmium-tool, GDAL, a bundled Java 21 runtime + planetiler, spreet)
+plus the static style assets - `docker compose build` picks that up
+automatically. The bulk map *data* is too large to ship in an image, so
+it is fetched into the data volume on demand. Steps 1-3 below therefore
+happen by themselves; only step 4 is manual, and it is optional.
 
 **1. A regional OSM extract** - *automatic.* The
 vector basemap layer (roads, water, land use, place labels) is cut from
@@ -168,50 +168,18 @@ the bundled jar - those URLs are pinned inside it and change between
 releases. `maplibre_allow_downloads: False` turns this off along with the
 OSM extracts, for an air-gapped worker.
 
-### HTTP proxy
+**3. Static style assets** - *automatic.* The sprite sheet (CC0 Maki
+icons), the font glyphs (prebuilt OFL Noto Sans PBF ranges) and
+`xcsoar-maplibre-poc/style/style.json.tmpl` are identical for every job
+and only ~35MB, so `docker compose build` bakes them into the worker
+image at `/opt/mapgen/maplibre-static/`.
 
-In case you are executing behind an HTTP proxy: 
-**Java does not read `http_proxy`/`https_proxy`**, so a wrapper script:
-`container/worker/planetiler` now translates whatever proxy variables are
-in the environment into the `-D` system properties Java actually honours.
-
-Put the values in a **`.env` file next to `docker-compose.yml`** - it is
-git-ignored, and `docker compose` reads it automatically for both the
-build and the running container:
-
-```bash
-cat > .env <<'EOF'
-http_proxy=http://proxy.example.com:8080/
-https_proxy=http://proxy.example.com:8080/
-no_proxy=localhost,127.0.0.1
-EOF
-```
-
-Note: Without a `.env` these resolve to empty strings and everything behaves 
-normally.
-
-**3. Static style assets** (sprite sheet + font glyphs, identical for every
-job, built once):
-
-```bash
-mkdir -p ~/.xcsoar_mapgen/mapgen-data/maplibre-static/{sprites,glyphs}
-cp xcsoar-maplibre-poc/style/style.json.tmpl \
-  ~/.xcsoar_mapgen/mapgen-data/maplibre-static/
-
-curl -L -o /tmp/noto-sans.zip \
-  https://github.com/openmaptiles/fonts/releases/download/v2.0/noto-sans.zip
-unzip -j /tmp/noto-sans.zip 'Noto Sans Regular/*' \
-  -d ~/.xcsoar_mapgen/mapgen-data/maplibre-static/glyphs/'Noto Sans Regular'
-
-curl -L -o /tmp/maki.zip \
-  https://github.com/mapbox/maki/archive/refs/heads/main.zip
-unzip -j /tmp/maki.zip 'maki-main/icons/*.svg' -d /tmp/maki_icons
-docker compose run --rm --no-deps -v /tmp/maki_icons:/workspace/maki_icons:ro \
-  --entrypoint bash mapgen-worker -c '
-    spreet /workspace/maki_icons /opt/mapgen/data/maplibre-static/sprites/sprite
-    spreet --ratio 2 /workspace/maki_icons /opt/mapgen/data/maplibre-static/sprites/sprite@2x
-  '
-```
+The style template lives in the source tree and is baked in as the
+image's *last* layer, so editing it and rebuilding costs a ~30kB layer
+rather than re-running the downloads above. `bin/mapgen --maplibre-static
+DIR` searches `DIR` first if you want to try a variant without a
+rebuild; it resolves per asset, so a directory holding only a style
+template still gets its glyphs and sprites from the image.
 
 **4. (Optional, better hillshade quality for France) Sonny's LiDAR DTM** -
 see `xcsoar-maplibre-poc/docs/DATA_SOURCES.md`. The download links are
@@ -225,8 +193,9 @@ Note that this data is **not** used unless a job asks for it: choose
 "Maximum" on the web form, or pass `--dem-arcsec 1`. See "Elevation data
 resolution" below for why it is opt-in.
 
-Once steps 1-3 are done, `docker compose up -d` and the checkbox on the
-web form (or `bin/mapgen --maplibre`) works. See
+`docker compose up -d` and the checkbox on the web form (or `bin/mapgen
+--maplibre`) works with no setup beyond the volumes; the first bundle a
+worker builds is slower while it populates its caches. See
 `xcsoar-maplibre-poc/README.md` for the design rationale and
 `xcsoar-maplibre-poc/docs/GENERATE_TEST_BUNDLE.md` for a full walkthrough
 with a validation script.
@@ -306,3 +275,26 @@ Tests are in the folder `tests`. Run the test suite with:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+
+### HTTP proxy
+
+In case you are executing behind an HTTP proxy: 
+**Java does not read `http_proxy`/`https_proxy`**, so a wrapper script:
+`container/worker/planetiler` now translates whatever proxy variables are
+in the environment into the `-D` system properties Java actually honours.
+
+Put the values in a **`.env` file next to `docker-compose.yml`** - it is
+git-ignored, and `docker compose` reads it automatically for both the
+build and the running container:
+
+```bash
+cat > .env <<'EOF'
+http_proxy=http://proxy.example.com:8080/
+https_proxy=http://proxy.example.com:8080/
+no_proxy=localhost,127.0.0.1
+EOF
+```
+
+Note: Without a `.env` these resolve to empty strings and everything behaves 
+normally.

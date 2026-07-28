@@ -8,16 +8,12 @@
 # Prerequisites (see docs/GENERATE_TEST_BUNDLE.md for the full walkthrough):
 #   - `docker compose build mapgen-worker` (picks up
 #     container/worker/Dockerfile's osmium/gdal/planetiler/spreet deps)
-#   - data/dem/*.hgt or data/dem3/*.hgt, and
-#     data/planetiler-sources/{lake_centerline.shp.zip,
-#     water-polygons-split-3857.zip,natural_earth_vector.sqlite.zip}
-#     pre-fetched into the mapgen-data volume
-#     (the OSM extract is NOT a prerequisite any more - it is downloaded
-#     on demand for whatever bounding box is asked for)
-#   - data/maplibre-static/{style.json.tmpl,sprites/,glyphs/} built once
+#   - data/dem/*.hgt or data/dem3/*.hgt in the mapgen-data volume
 #
-# This script does NOT download or build any of the above itself - see
-# docs/GENERATE_TEST_BUNDLE.md steps 0-2.
+# The OSM extract, Planetiler's auxiliary sources and the static style
+# assets are no longer prerequisites: the first two are downloaded on
+# demand for whatever bounding box is asked for, the third is baked into
+# the worker image. See docs/GENERATE_TEST_BUNDLE.md step 0.
 
 set -euo pipefail
 
