@@ -134,11 +134,11 @@
       "source": "openmaptiles",
       "source-layer": "mountain_peak",
       "filter": ["has", "name"],
-      "minzoom": 9,
+      "minzoom": 7,
       "layout": {
         "symbol-sort-key": ["get", "rank"],
         "icon-image": "mountain",
-        "icon-size": 0.8,
+        "icon-size": 1.2,
         "icon-allow-overlap": false,
         "text-field": [
           "case",
@@ -147,14 +147,14 @@
           ["get", "name"]
         ],
         "text-font": ["Noto Sans Regular"],
-        "text-size": 11,
+        "text-size": 12,
         "text-anchor": "top",
         "text-offset": [0, 0.6]
       },
       "paint": {
-        "text-color": "#5b3a29",
+        "text-color": "#000000",
         "text-halo-color": "#ffffff",
-        "text-halo-width": 1.2
+        "text-halo-width": 1.4
       }
     },
     {
@@ -169,7 +169,7 @@
         "text-size": 12
       },
       "paint": {
-        "text-color": "#3a3a3a",
+        "text-color": "#000000",
         "text-halo-color": "#ffffff",
         "text-halo-width": 1.2
       }
